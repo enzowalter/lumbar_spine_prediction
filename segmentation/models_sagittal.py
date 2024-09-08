@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torchvision
 
 class ImageEncoder(nn.Module):
-    def __init__(self, out_features):
+    def __init__(self):
         super().__init__()
         self.backbone = torchvision.models.efficientnet_b0(weights="DEFAULT")
 

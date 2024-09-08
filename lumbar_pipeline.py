@@ -164,6 +164,9 @@ def get_best_slice_selection(config, pathes, topk, device='cpu'):
         images[k, 0, ...] = im
     images = torch.tensor(images).expand(nb_slices, 3, *config['slice_selection_input_shape']).float()
     preds = config['model_slice_selection'](images.to(device).unsqueeze(0)).squeeze()
+    preds_overall = torch.sum(preds, dim=0)
+
+    # get best by level
     slices_by_level = [
         {"pathes": list(), "values": list()} for _ in range(preds.shape[0])
     ]
@@ -172,7 +175,14 @@ def get_best_slice_selection(config, pathes, topk, device='cpu'):
         values, max_indice = torch.topk(pred_level, topk)
         slices_by_level[level]['pathes'] = [pathes[i.item()] for i in max_indice]
         slices_by_level[level]['values'] = [v.item() for v in values]
-    return slices_by_level
+
+    # get best overall (=> best after sum of each level)
+    values, max_indices = torch.topk(preds_overall, topk)
+    best_slices_overall = dict()
+    best_slices_overall['pathes'] = [pathes[i.item()] for i in max_indices]
+    best_slices_overall['values'] = [v.item() for v in values]
+
+    return slices_by_level, best_slices_overall
 
 def get_slices_to_use(study_id, series_ids, config):
     """
@@ -188,21 +198,33 @@ def get_slices_to_use(study_id, series_ids, config):
     # compute best slices for each series
     best_slices_per_series = dict()
     for s_id in slices_by_series:
-        best_slices = get_best_slice_selection(config, slices_by_series[s_id], topk=5)
-        best_slices_per_series[s_id] = best_slices
+        best_slices, best_slices_overall = get_best_slice_selection(config, slices_by_series[s_id], topk=5)
+        best_slices_per_series[s_id] = {
+            "best_per_level": best_slices, 
+            "best_overall": best_slices_overall,
+        }
     
     # find best series for each level
     #   => highest activation on selection
-    slices_to_use = [list() for _ in range(5)]
+    best_slices_per_level = [list() for _ in range(5)]
     for level in range(5):
         best_level = 0
         for s_id in best_slices_per_series:
-            sum_series = sum(best_slices_per_series[s_id][level]['values'])
+            sum_series = sum(best_slices_per_series[s_id]["best_per_level"][level]['values'])
             if sum_series > best_level:
                 best_level = sum_series
-                slices_to_use[level] = best_slices_per_series[s_id][level]['pathes']
+                best_slices_per_level[level] = best_slices_per_series[s_id]["best_per_level"][level]['pathes']
 
-    return slices_to_use
+    # find best overall series
+    best_slices_overall = list()
+    best_sum = 0
+    for s_id in best_slices_per_series:
+        sum_series = sum(best_slices_per_series[s_id]["best_overall"]['values'])
+        if sum_series > best_sum:
+            best_slices_overall = best_slices_per_series[s_id]["best_overall"]['pathes']
+            best_sum = sum_series
+
+    return best_slices_per_level, best_slices_overall
 
 ##########################################################
 #
@@ -222,17 +244,32 @@ def find_center_of_largest_activation(mask: torch.tensor) -> tuple:
     return (center_coords[1] / mask.shape[1], center_coords[0] / mask.shape[0]) # x, y normalised
 
 def get_segmentation_input(slices_to_use: list, config: dict):
-    images = np.zeros((5, 1, *config['segmentation_input_shape']))
-    for level in range(5):
-        slice_to_use = slices_to_use[level][0] # 1 slice per level => the best one
-        im = cv2.resize(pydicom.dcmread(slice_to_use).pixel_array.astype(np.float32), 
-                        config['segmentation_input_shape'],
-                        interpolation=cv2.INTER_LINEAR
-                    )
-        im = (im - im.min()) / (im.max() - im.min() + 1e-9)
-        images[level, 0, ...] = im
-    images = torch.tensor(images).expand(5, 3, *config['segmentation_input_shape']).float()
-    return images
+    if config['segmentation_slice_selection'] == "best_overall":
+        images = np.zeros((3, *config['segmentation_input_shape']))
+        _slices_path = slices_to_use['best_overall'][:3]
+        for k, path in enumerate(_slices_path):
+            im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
+                            config['segmentation_input_shape'],
+                            interpolation=cv2.INTER_LINEAR
+                        )
+            im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+            images[k, ...] = im
+        images = torch.tensor(images).float()
+        return images
+    elif config['segmentation_slice_selection'] == "best_by_level":
+        images = np.zeros((5, 1, *config['segmentation_input_shape']))
+        for level in range(5):
+            slice_to_use = slices_to_use['best_by_level'][level][0] # 1 slice per level => the best one
+            im = cv2.resize(pydicom.dcmread(slice_to_use).pixel_array.astype(np.float32), 
+                            config['segmentation_input_shape'],
+                            interpolation=cv2.INTER_LINEAR
+                        )
+            im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+            images[level, 0, ...] = im
+        images = torch.tensor(images).expand(5, 3, *config['segmentation_input_shape']).float()
+        return images
+    else:
+        return None
 
 def get_position_by_level(slices_to_use: list, config: dict) -> dict:
     inputs = get_segmentation_input(slices_to_use, config)
@@ -265,18 +302,17 @@ def cut_crops(slices_path, x, y, crop_size, image_resize):
         pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
         pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min() + 1e-9)
-        crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
+        crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # reverse x y for cutting
         output_crops[k, 0, ...] = crop
     return output_crops
 
 def get_crops_by_level(slices_to_use, position_by_level, config):
     crops_output = np.zeros((5, 5, 1, *config['classification_input_size']))
-    for level, (slices_, position) in enumerate(zip(slices_to_use, position_by_level)):
+    for level, (slices_, position) in enumerate(zip(slices_to_use["best_by_level"], position_by_level)):
         slices = sorted(slices_[:config['classification_sequence_lenght']], key = lambda x : get_instance(x))
         px = int(position[0] * config['classification_resize_image'][0])
-        py = int(position[1] * config['classification_resize_image'][1])
-        # reverse x, y for cutting
-        crops_output[level, ...] = cut_crops(slices, py, px, config['classification_input_size'], config['classification_resize_image'])
+        py = int(position[1] * config['classification_resize_image'][0])
+        crops_output[level, ...] = cut_crops(slices, px, py, config['classification_input_size'], config['classification_resize_image'])
 
     crops_output = torch.tensor(crops_output).float()
     crops_output = crops_output.expand(5, 5, 3, *config['classification_input_size'])
@@ -299,7 +335,12 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict) -> list:
         series_ids = df_description[(df_description['study_id'] == study_id)
                                 & (df_description['series_description'] == config['description'])]['series_id'].to_list()
         
-        slices_to_use = get_slices_to_use(study_id, series_ids, config)
+        best_slices_by_level, best_slices_overall = get_slices_to_use(study_id, series_ids, config)
+        slices_to_use = dict(
+            best_by_level=best_slices_by_level,
+            best_overall=best_slices_overall
+        )
+        
         positions_by_level = get_position_by_level(slices_to_use, config)
         crops_by_level = get_crops_by_level(slices_to_use, positions_by_level, config)
         classification_results = get_classification(crops_by_level, config)
@@ -313,9 +354,10 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict) -> list:
                 moderate = classification_results[level_int][1].item(),
                 severe = classification_results[level_int][2].item(),
             ))
+
     return predictions
 
-def configure_inference(slice_model_path, seg_model_path, class_model, input_folder, description, condition, class_input_size, class_resize_image):
+def configure_inference(slice_model_path, seg_model_path, class_model, input_folder, description, condition, class_input_size, class_resize_image, seg_mode):
     return dict(
         model_slice_selection=load_torch_script_model(slice_model_path),
         model_segmentation=load_torch_script_model(seg_model_path),
@@ -328,7 +370,8 @@ def configure_inference(slice_model_path, seg_model_path, class_model, input_fol
         classification_sequence_lenght=5,
         description=description,
         condition=condition,
-        input_images_folder=input_folder
+        input_images_folder=input_folder,
+        segmentation_slice_selection=seg_mode,
     )
 
 if __name__ == "__main__":
@@ -338,54 +381,59 @@ if __name__ == "__main__":
 
     tasks = [
         {
-            "class_model_path": "trained_models/model_classification_st2.pth",
-            "slice_model_path": "trained_models/model_slice_selection_st2.ts",
+            "class_model_path": "trained_models/v0/model_classification_st2.pth",
+            "slice_model_path": "trained_models/v0/model_slice_selection_st2.ts",
             "seg_model_path": "trained_models/model_segmentation_st2.ts",
             "encoder": "squeezenet",
             "description": "Sagittal T2/STIR",
             "condition": "Spinal Canal Stenosis",
-            "class_input_size": (96, 164),
-            "class_resize_image": (600, 600)
+            "class_input_size": (164, 250),
+            "class_resize_image": (600, 600),
+            "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/model_classification_st1_left.pth",
-            "slice_model_path": "trained_models/model_slice_selection_st1_left.ts",
+            "class_model_path": "trained_models/v0/model_classification_st1_left.pth",
+            "slice_model_path": "trained_models/v0/model_slice_selection_st1_left.ts",
             "seg_model_path": "trained_models/model_segmentation_st1_left.ts",
             "encoder": "squeezenet",
             "description": "Sagittal T1",
             "condition": "Left Neural Foraminal Narrowing",
-            "class_input_size": (96, 164),
-            "class_resize_image": (600, 600)
+            "class_input_size": (164, 250),
+            "class_resize_image": (600, 600),
+            "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/model_classification_st1_right.pth",
-            "slice_model_path": "trained_models/model_slice_selection_st1_right.ts",
+            "class_model_path": "trained_models/v0/model_classification_st1_right.pth",
+            "slice_model_path": "trained_models/v0/model_slice_selection_st1_right.ts",
             "seg_model_path": "trained_models/model_segmentation_st1_right.ts",
             "encoder": "efficientnet",
             "description": "Sagittal T1",
             "condition": "Right Neural Foraminal Narrowing",
-            "class_input_size": (96, 164),
-            "class_resize_image": (600, 600)
+            "class_input_size": (164, 250),
+            "class_resize_image": (600, 600),
+            "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/model_classification_axt2_left.pth",
-            "slice_model_path": "trained_models/model_slice_selection_axt2_left.ts",
-            "seg_model_path": "trained_models/model_segmentation_axt2_left.ts",
+            "class_model_path": "trained_models/v0/model_classification_axt2_left.pth",
+            "slice_model_path": "trained_models/v0/model_slice_selection_axt2_left.ts",
+            "seg_model_path": "trained_models/v0/model_segmentation_axt2_left.ts",
             "encoder": "efficientnet",
             "description": "Axial T2",
             "condition": "Left Subarticular Stenosis",
             "class_input_size": (164, 164),
-            "class_resize_image": (800, 800)
+            "class_resize_image": (600, 600),
+            "segmentation_slice_selection": "best_by_level",
         },
         {
-            "class_model_path": "trained_models/model_classification_axt2_right.pth",
-            "slice_model_path": "trained_models/model_slice_selection_axt2_right.ts",
-            "seg_model_path": "trained_models/model_segmentation_axt2_right.ts",
+            "class_model_path": "trained_models/v0/model_classification_axt2_right.pth",
+            "slice_model_path": "trained_models/v0/model_slice_selection_axt2_right.ts",
+            "seg_model_path": "trained_models/v0/model_segmentation_axt2_right.ts",
             "encoder": "squeezenet",
             "description": "Axial T2",
             "condition": "Right Subarticular Stenosis",
             "class_input_size": (164, 164),
-            "class_resize_image": (800, 800)
+            "class_resize_image": (600, 600),
+            "segmentation_slice_selection": "best_by_level",
         }
     ]
 
@@ -400,7 +448,8 @@ if __name__ == "__main__":
             task["description"],
             task["condition"],
             task["class_input_size"],
-            task["class_resize_image"]
+            task["class_resize_image"],
+            task["segmentation_slice_selection"],
         )
         _predictions = predict_lumbar(df_description, config)
         final_predictions.extend(_predictions)
