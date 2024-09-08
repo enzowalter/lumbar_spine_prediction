@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torchvision
 
 class ExpertEncoder(nn.Module):
-    def __init__(self, encoder_name, out_features, sequence_lenght, backbone_features=1280):
+    def __init__(self, encoder_name, out_features, sequence_lenght):
         super().__init__()
         self.sequence_lenght = sequence_lenght
         if encoder_name == "efficientnet":
@@ -84,7 +84,7 @@ class ExperCeption(nn.Module):
             for i in range(num_experts):
                 for j in range(i + 1, num_experts):
                     cos_sim = F.cosine_similarity(expert_outputs[:, i], expert_outputs[:, j], dim=-1)
-                    loss += cos_sim.mean()
+                    loss += torch.abs(cos_sim.mean())
             return loss / (num_experts * (num_experts - 1) / 2)
         return 0
 

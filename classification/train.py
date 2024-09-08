@@ -198,7 +198,7 @@ def train_model(input_dir, conditions, description, slice_model_path, crop_size,
     nb_valid = int(len(dataset) * 0.1)
     train_dataset = SegmentationDataset(dataset[nb_valid:])
     valid_dataset = SegmentationDataset(dataset[:nb_valid])
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=12, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
     model = ExperCeption(
@@ -211,12 +211,12 @@ def train_model(input_dir, conditions, description, slice_model_path, crop_size,
     )
 
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
 
     best_metrics = None
     best = -1
-    for epoch in range(20):
+    for epoch in range(8):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)

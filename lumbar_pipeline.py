@@ -331,7 +331,7 @@ def get_classification(crops: torch.tensor, config):
 
 def predict_lumbar(df_description: pd.DataFrame, config: dict) -> list:
     studies_id = df_description["study_id"].unique()
-    for study_id in tqdm.tqdm(studies_id, desc="Predicting"):
+    for study_id in tqdm.tqdm(studies_id[:50], desc="Predicting"):
         series_ids = df_description[(df_description['study_id'] == study_id)
                                 & (df_description['series_description'] == config['description'])]['series_id'].to_list()
         
@@ -375,8 +375,8 @@ def configure_inference(slice_model_path, seg_model_path, class_model, input_fol
     )
 
 if __name__ == "__main__":
-    input_images_folder = "../REFAIT/test_images/"
-    df_description = pd.read_csv("../REFAIT/test_series_descriptions.csv")
+    input_images_folder = "../REFAIT/train_images/"
+    df_description = pd.read_csv("../REFAIT/train_series_descriptions.csv")
     final_predictions = []
 
     tasks = [
@@ -387,8 +387,8 @@ if __name__ == "__main__":
             "encoder": "squeezenet",
             "description": "Sagittal T2/STIR",
             "condition": "Spinal Canal Stenosis",
-            "class_input_size": (164, 250),
-            "class_resize_image": (600, 600),
+            "class_input_size": (128, 256),
+            "class_resize_image": (700, 700),
             "segmentation_slice_selection": "best_overall",
         },
         {
@@ -398,8 +398,8 @@ if __name__ == "__main__":
             "encoder": "squeezenet",
             "description": "Sagittal T1",
             "condition": "Left Neural Foraminal Narrowing",
-            "class_input_size": (164, 250),
-            "class_resize_image": (600, 600),
+            "class_input_size": (128, 256),
+            "class_resize_image": (700, 700),
             "segmentation_slice_selection": "best_overall",
         },
         {
@@ -409,8 +409,8 @@ if __name__ == "__main__":
             "encoder": "efficientnet",
             "description": "Sagittal T1",
             "condition": "Right Neural Foraminal Narrowing",
-            "class_input_size": (164, 250),
-            "class_resize_image": (600, 600),
+            "class_input_size": (128, 256),
+            "class_resize_image": (700, 700),
             "segmentation_slice_selection": "best_overall",
         },
         {
@@ -420,8 +420,8 @@ if __name__ == "__main__":
             "encoder": "efficientnet",
             "description": "Axial T2",
             "condition": "Left Subarticular Stenosis",
-            "class_input_size": (164, 164),
-            "class_resize_image": (600, 600),
+            "class_input_size": (224, 224),
+            "class_resize_image": (800, 800),
             "segmentation_slice_selection": "best_by_level",
         },
         {
@@ -431,8 +431,8 @@ if __name__ == "__main__":
             "encoder": "squeezenet",
             "description": "Axial T2",
             "condition": "Right Subarticular Stenosis",
-            "class_input_size": (164, 164),
-            "class_resize_image": (600, 600),
+            "class_input_size": (224, 224),
+            "class_resize_image": (800, 800),
             "segmentation_slice_selection": "best_by_level",
         }
     ]
