@@ -23,10 +23,10 @@ class ExpertEncoder(nn.Module):
         super().__init__()
         self.sequence_lenght = sequence_lenght
         if encoder_name == "efficientnet":
-            self.encoder = torchvision.models.efficientnet_b0(weights="DEFAULT")
+            self.encoder = torchvision.models.efficientnet_b0()
             self.classifier = nn.Linear(1280, out_features)
         elif encoder_name == "squeezenet":
-            self.encoder = torchvision.models.squeezenet1_0(weights="DEFAULT")
+            self.encoder = torchvision.models.squeezenet1_0()
             self.classifier = nn.Linear(512, out_features)
         else:
             raise NotImplementedError("Unknown encoder")
@@ -127,6 +127,9 @@ class ExperCeption(nn.Module):
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
 
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 def load_model_classification(model_path, encoder="efficientnet"):
     model_classification = ExperCeption(
         num_classes=3,
@@ -137,10 +140,10 @@ def load_model_classification(model_path, encoder="efficientnet"):
         encoder=encoder,
     )
     model_classification.load_state_dict(torch.load(model_path, weights_only=True, map_location="cpu"))
-    return model_classification.eval()
+    return model_classification.eval().to(get_device())
 
 def load_torch_script_model(path):
-    return torch.jit.load(path, map_location="cpu").eval()
+    return torch.jit.load(path, map_location="cpu").eval().to(get_device())
 
 ##########################################################
 #
@@ -148,7 +151,7 @@ def load_torch_script_model(path):
 #
 ##########################################################
 
-def get_best_slice_selection(config, pathes, topk, device='cpu'):
+def get_best_slice_selection(config, pathes, topk):
     """
     Return best slices for each level.
     Slice are not sorted by instance_number, they are sorted by topk
@@ -163,7 +166,7 @@ def get_best_slice_selection(config, pathes, topk, device='cpu'):
         im = (im - im.min()) / (im.max() - im.min() + 1e-9)
         images[k, 0, ...] = im
     images = torch.tensor(images).expand(nb_slices, 3, *config['slice_selection_input_shape']).float()
-    preds = config['model_slice_selection'](images.to(device).unsqueeze(0)).squeeze()
+    preds = config['model_slice_selection'](images.to(config["device"]).unsqueeze(0)).squeeze()
     preds_overall = torch.sum(preds, dim=0)
 
     # get best by level
@@ -254,7 +257,7 @@ def get_segmentation_input(slices_to_use: list, config: dict):
                         )
             im = (im - im.min()) / (im.max() - im.min() + 1e-9)
             images[k, ...] = im
-        images = torch.tensor(images).float()
+        images = torch.tensor(images).float().to(config["device"])
         return images
     elif config['segmentation_slice_selection'] == "best_by_level":
         images = np.zeros((5, 1, *config['segmentation_input_shape']))
@@ -266,7 +269,7 @@ def get_segmentation_input(slices_to_use: list, config: dict):
                         )
             im = (im - im.min()) / (im.max() - im.min() + 1e-9)
             images[level, 0, ...] = im
-        images = torch.tensor(images).expand(5, 3, *config['segmentation_input_shape']).float()
+        images = torch.tensor(images).expand(5, 3, *config['segmentation_input_shape']).float().to(config["device"])
         return images
     else:
         return None
@@ -309,12 +312,15 @@ def cut_crops(slices_path, x, y, crop_size, image_resize):
 def get_crops_by_level(slices_to_use, position_by_level, config):
     crops_output = np.zeros((5, 5, 1, *config['classification_input_size']))
     for level, (slices_, position) in enumerate(zip(slices_to_use["best_by_level"], position_by_level)):
-        slices = sorted(slices_[:config['classification_sequence_lenght']], key = lambda x : get_instance(x))
-        px = int(position[0] * config['classification_resize_image'][0])
-        py = int(position[1] * config['classification_resize_image'][0])
-        crops_output[level, ...] = cut_crops(slices, px, py, config['classification_input_size'], config['classification_resize_image'])
+        if position is not None:
+            slices = sorted(slices_[:config['classification_sequence_lenght']], key = lambda x : get_instance(x))
+            px = int(position[0] * config['classification_resize_image'][0])
+            py = int(position[1] * config['classification_resize_image'][0])
+            crops_output[level, ...] = cut_crops(slices, px, py, config['classification_input_size'], config['classification_resize_image'])
+        else:
+            print("No prediction on segmentation !", level)
 
-    crops_output = torch.tensor(crops_output).float()
+    crops_output = torch.tensor(crops_output).float().to(config["device"])
     crops_output = crops_output.expand(5, 5, 3, *config['classification_input_size'])
     return crops_output
 
@@ -329,9 +335,8 @@ def get_classification(crops: torch.tensor, config):
 #
 ##########################################################
 
-def predict_lumbar(df_description: pd.DataFrame, config: dict) -> list:
-    studies_id = df_description["study_id"].unique()
-    for study_id in tqdm.tqdm(studies_id[:50], desc="Predicting"):
+def predict_lumbar(df_description: pd.DataFrame, config: dict, study_id: int) -> list:
+    try:
         series_ids = df_description[(df_description['study_id'] == study_id)
                                 & (df_description['series_description'] == config['description'])]['series_id'].to_list()
         
@@ -344,21 +349,25 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict) -> list:
         positions_by_level = get_position_by_level(slices_to_use, config)
         crops_by_level = get_crops_by_level(slices_to_use, positions_by_level, config)
         classification_results = get_classification(crops_by_level, config)
-        
-        predictions = list()
-        row_id = f"{study_id}_{config['condition'].lower().replace(' ', '_')}"
-        for level_int, level_str in enumerate(['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']):
-            predictions.append(dict(
-                row_id = f"{row_id}_{level_str}",
-                normal_mild = classification_results[level_int][0].item(),
-                moderate = classification_results[level_int][1].item(),
-                severe = classification_results[level_int][2].item(),
-            ))
+    except Exception as e:
+        print(f"Error {study_id} {config['condition']}:", e)
+        classification_results = None
+
+    predictions = list()
+    row_id = f"{study_id}_{config['condition'].lower().replace(' ', '_')}"
+    for level_int, level_str in enumerate(['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']):
+        predictions.append(dict(
+            row_id = f"{row_id}_{level_str}",
+            normal_mild = classification_results[level_int][0].item() if classification_results is not None else 1/3,
+            moderate = classification_results[level_int][1].item() if classification_results is not None else 1/3,
+            severe = classification_results[level_int][2].item() if classification_results is not None else 1/3,
+        ))
 
     return predictions
 
 def configure_inference(slice_model_path, seg_model_path, class_model, input_folder, description, condition, class_input_size, class_resize_image, seg_mode):
     return dict(
+        device=get_device(),
         model_slice_selection=load_torch_script_model(slice_model_path),
         model_segmentation=load_torch_script_model(seg_model_path),
         model_classification=class_model,
@@ -381,64 +390,66 @@ if __name__ == "__main__":
 
     tasks = [
         {
-            "class_model_path": "trained_models/v0/model_classification_st2.pth",
-            "slice_model_path": "trained_models/v0/model_slice_selection_st2.ts",
-            "seg_model_path": "trained_models/model_segmentation_st2.ts",
-            "encoder": "squeezenet",
+            "class_model_path": "trained_models/v1/model_classification_st2.pth",
+            "slice_model_path": "trained_models/v1/model_slice_selection_st2.ts",
+            "seg_model_path": "trained_models/v1/model_segmentation_st2.ts",
+            "encoder": "efficientnet",
             "description": "Sagittal T2/STIR",
             "condition": "Spinal Canal Stenosis",
-            "class_input_size": (128, 256),
-            "class_resize_image": (700, 700),
+            "class_input_size": (96, 164),
+            "class_resize_image": (600, 600),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v0/model_classification_st1_left.pth",
-            "slice_model_path": "trained_models/v0/model_slice_selection_st1_left.ts",
-            "seg_model_path": "trained_models/model_segmentation_st1_left.ts",
-            "encoder": "squeezenet",
+            "class_model_path": "trained_models/v1/model_classification_st1_left.pth",
+            "slice_model_path": "trained_models/v1/model_slice_selection_st1_left.ts",
+            "seg_model_path": "trained_models/v1/model_segmentation_st1_left.ts",
+            "encoder": "efficientnet",
             "description": "Sagittal T1",
             "condition": "Left Neural Foraminal Narrowing",
-            "class_input_size": (128, 256),
-            "class_resize_image": (700, 700),
+            "class_input_size": (96, 164),
+            "class_resize_image": (600, 600),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v0/model_classification_st1_right.pth",
-            "slice_model_path": "trained_models/v0/model_slice_selection_st1_right.ts",
-            "seg_model_path": "trained_models/model_segmentation_st1_right.ts",
+            "class_model_path": "trained_models/v1/model_classification_st1_right.pth",
+            "slice_model_path": "trained_models/v1/model_slice_selection_st1_right.ts",
+            "seg_model_path": "trained_models/v1/model_segmentation_st1_right.ts",
             "encoder": "efficientnet",
             "description": "Sagittal T1",
             "condition": "Right Neural Foraminal Narrowing",
-            "class_input_size": (128, 256),
-            "class_resize_image": (700, 700),
+            "class_input_size": (96, 164),
+            "class_resize_image": (600, 600),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v0/model_classification_axt2_left.pth",
-            "slice_model_path": "trained_models/v0/model_slice_selection_axt2_left.ts",
-            "seg_model_path": "trained_models/v0/model_segmentation_axt2_left.ts",
+            "class_model_path": "trained_models/v1/model_classification_axt2_left.pth",
+            "slice_model_path": "trained_models/v1/model_slice_selection_axt2_left.ts",
+            "seg_model_path": "trained_models/v1/model_segmentation_axt2_left.ts",
             "encoder": "efficientnet",
             "description": "Axial T2",
             "condition": "Left Subarticular Stenosis",
-            "class_input_size": (224, 224),
+            "class_input_size": (164, 164),
             "class_resize_image": (800, 800),
             "segmentation_slice_selection": "best_by_level",
         },
         {
-            "class_model_path": "trained_models/v0/model_classification_axt2_right.pth",
-            "slice_model_path": "trained_models/v0/model_slice_selection_axt2_right.ts",
-            "seg_model_path": "trained_models/v0/model_segmentation_axt2_right.ts",
-            "encoder": "squeezenet",
+            "class_model_path": "trained_models/v1/model_classification_axt2_right.pth",
+            "slice_model_path": "trained_models/v1/model_slice_selection_axt2_right.ts",
+            "seg_model_path": "trained_models/v1/model_segmentation_axt2_right.ts",
+            "encoder": "efficientnet",
             "description": "Axial T2",
             "condition": "Right Subarticular Stenosis",
-            "class_input_size": (224, 224),
+            "class_input_size": (164, 164),
             "class_resize_image": (800, 800),
             "segmentation_slice_selection": "best_by_level",
         }
     ]
 
+    studies_id = df_description["study_id"].unique()
+    task_configs = []
     for task in tasks:
-        print('task', task['condition'], task['description'])
+        print(f'Loading models and configuring for task: {task["condition"]}')
         model_classification = load_model_classification(task["class_model_path"], encoder=task["encoder"])
         config = configure_inference(
             task["slice_model_path"],
@@ -451,7 +462,12 @@ if __name__ == "__main__":
             task["class_resize_image"],
             task["segmentation_slice_selection"],
         )
-        _predictions = predict_lumbar(df_description, config)
-        final_predictions.extend(_predictions)
+        task_configs.append(config)
+
+    for study_id in tqdm.tqdm(studies_id[225:226], desc="Predicting for each study"):
+        print(study_id)
+        for config in task_configs:
+            _predictions = predict_lumbar(df_description, config, study_id)
+            final_predictions.extend(_predictions)
 
     pd.DataFrame(final_predictions).to_csv("submission.csv", index=False)
