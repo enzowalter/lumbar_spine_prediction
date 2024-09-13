@@ -15,108 +15,96 @@ from scipy.ndimage import label, center_of_mass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
+import timm
 
-class ExpertEncoder(nn.Module):
-    def __init__(self, encoder_name, out_features, sequence_lenght):
-        super().__init__()
-        self.sequence_lenght = sequence_lenght
-        if encoder_name == "efficientnet":
-            self.encoder = torchvision.models.efficientnet_b0()
-            self.classifier = nn.Linear(1280, out_features)
-        elif encoder_name == "squeezenet":
-            self.encoder = torchvision.models.squeezenet1_0()
-            self.classifier = nn.Linear(512, out_features)
+class DynamicModelLoader:
+    def __init__(self, model_name, num_classes=3, pretrained=True, hidden_size=256):
+        self.model = timm.create_model(model_name, pretrained=pretrained)
+        self.num_classes = num_classes
+        self.hidden_size = hidden_size
+        self.feature_size = self.get_feature_size()
+        self.model = self.modify_classifier()
+
+    def get_feature_size(self):
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            features = self.model.forward_features(dummy_input)
+            return features.shape[1]
+    
+    def modify_classifier(self):
+        if hasattr(self.model, 'fc'):
+            in_features = self.model.fc.in_features
+            self.model.fc = nn.Sequential(
+                nn.Linear(in_features, self.hidden_size),
+            )
+        elif hasattr(self.model, 'classifier'):
+            in_features = self.model.classifier.in_features
+            self.model.classifier = nn.Sequential(
+                nn.Linear(in_features, self.hidden_size),
+            )
         else:
-            raise NotImplementedError("Unknown encoder")
+            raise NotImplementedError("Unknown classifier structure")
+        return self.model
 
-    def _forward_image(self, image):
-        features = self.encoder.features(image)
-        features = features.mean(dim=(2, 3))
-        out = self.classifier(features)
-        return out
-
-    def forward(self, images):
-        out = torch.stack([self._forward_image(images[:, i]) for i in range(self.sequence_lenght)], dim=1)
-        return out
-
-class ExpertClassifier(nn.Module):
-    def __init__(self, in_features, sequence_lenght, num_classes):
+class FoldEncoder(nn.Module):
+    def __init__(self, features_size, backbone_name):
         super().__init__()
-        self.sequence_lenght = sequence_lenght
-        self.in_features = in_features
+        self.name = backbone_name
+        self.model = DynamicModelLoader(model_name=backbone_name, pretrained=False, hidden_size=features_size).model
 
-        self.gating_encoder = nn.Sequential(
-            nn.Linear(self.in_features, 1),
-            nn.Sigmoid()
-        )
+    def forward(self, x):
+        return self.model(x)
 
-        in_size = in_features * sequence_lenght
+class FoldClassifier(nn.Module):
+    def __init__(self, in_features, n_classes):
+        super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(in_size, in_size // 4),
+            nn.Linear(in_features, in_features // 4),
             nn.ReLU(),
-            nn.Linear(in_size // 4, num_classes)
+            nn.Linear(in_features // 4, n_classes)
         )
+    def forward(self, x):
+        x = self.classifier(x)
+        return x
 
-    def forward(self, encoded):
-        # shape = (batch_size, sequence_lenght, self.encoder_features)
-        gates_encoder = torch.sigmoid(self.gating_encoder(encoded))
-        encoder_output = torch.sum(gates_encoder * encoded, dim=1)
-        # encoder_output.shape = (batch_size, self.sequence_lenght, self.encoder_features)
-
-        encoder_output = encoder_output.reshape(encoded.shape[0], self.sequence_lenght * self.in_features)
-        return self.classifier(encoder_output)
-
-class ExperCeption(nn.Module):
-    def __init__(self, 
-                num_expert_encoder=3,
-                num_expert_classifier=3,
-                encoder_features=64,
-                num_classes=3,
-                sequence_lenght=5,
-                encoder="squeezenet"
-                ):
+class FoldModelClassifier(nn.Module):
+    def __init__(self, backbones, n_fold_classifier, features_size, n_classes):
         super().__init__()
-        self.num_expert_encoder = num_expert_encoder    
-        self.num_expert_classifier = num_expert_classifier    
-        self.encoder_features = encoder_features    
-        self.num_classes = num_classes    
-        self.sequence_lenght = sequence_lenght
-        self.encoder = encoder
+        self.n_fold_enc = len(backbones)
+        self.n_fold_cla = n_fold_classifier
+        self.features_size = features_size
+        
+        self.fold_backbones = nn.ModuleList([
+            FoldEncoder(features_size, backbone) for backbone in backbones
+        ])
 
-        self.experts_encoder = nn.ModuleList([ExpertEncoder(encoder_name=encoder, out_features=self.encoder_features, sequence_lenght=self.sequence_lenght) for _ in range(self.num_expert_encoder)])
-        self.experts_classifier = nn.ModuleList([ExpertClassifier(in_features=self.encoder_features, sequence_lenght=self.sequence_lenght, num_classes=self.num_classes) for _ in range(self.num_expert_classifier)])
+        self.fold_classifiers = nn.ModuleList([
+            FoldClassifier(features_size, n_classes) for _ in range(n_fold_classifier)
+        ])
 
-        self.gating_classifier = nn.Sequential(
-            nn.Linear(self.num_classes, 1),
-            nn.Sigmoid()
-        )
+    def forward(self, crop, mode):
+        if mode == "train":
+            r_b = torch.randint(0, self.n_fold_enc, (1,)).item()
+            backbone = self.fold_backbones[r_b]
 
-    def diversity_loss(self, num_experts, expert_outputs):
-        if num_experts > 1:
-            loss = 0.0
-            for i in range(num_experts):
-                for j in range(i + 1, num_experts):
-                    cos_sim = F.cosine_similarity(expert_outputs[:, i], expert_outputs[:, j], dim=-1)
-                    loss += cos_sim.mean()
-            return loss / (num_experts * (num_experts - 1) / 2)
-        return 0
+            r_c = torch.randint(0, self.n_fold_cla, (1,)).item()
+            classifier = self.fold_classifiers[r_c]
+    
+            encoded = backbone(crop)
+            output = classifier(encoded)
+            return output
 
-    def forward(self, images):
-        expert_encoder_output = torch.stack([self.experts_encoder[i](images) for i in range(self.num_expert_encoder)], dim=1)
-        loss_diversity_encoder = self.diversity_loss(self.num_expert_encoder, expert_encoder_output)
-        # expert_encoder_output.shape = (batch_size, self.num_expert_encoder, self.sequence_lenght, self.encoder_features)
+        if mode == "valid" or mode == "inference":
+            final_output = list()
+            _encodeds = torch.stack([backbone(crop) for backbone in self.fold_backbones], dim=1)
+            for classifier in self.fold_classifiers:
+                classified_ = torch.stack([classifier(_encodeds[:, i]) for i in range(self.n_fold_enc)], dim=1)
+                classifier_output = torch.mean(classified_, dim=1)
+                final_output.append(classifier_output)
 
-        expert_classifier_output = torch.stack([self.experts_classifier[i](expert_encoder_output) for i in range(self.num_expert_classifier)], dim = 1)
-        loss_diversity_classifier = self.diversity_loss(self.num_expert_classifier, expert_classifier_output)
-        # expert_classifier_output.shape = (batch_size, self.num_expert_classifier, self.sequence_lenght * self.num_classes)
-
-        gates_classifier = torch.sigmoid(self.gating_classifier(expert_classifier_output))
-        classifier_output = torch.sum(gates_classifier * expert_classifier_output, dim=1)
-        # classifier_output.shape = (batch_size, self.num_classes)
-
-        return classifier_output, loss_diversity_encoder + loss_diversity_classifier
+            final_output = torch.stack(final_output, dim=1)
+            final_output = torch.mean(final_output, dim=1)
+            return final_output
 
 ##########################################################
 #
@@ -130,17 +118,16 @@ def get_instance(path):
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def load_model_classification(model_path, encoder="efficientnet"):
-    model_classification = ExperCeption(
-        num_classes=3,
-        num_expert_classifier=3,
-        num_expert_encoder=3,
-        sequence_lenght=5,
-        encoder_features=64,
-        encoder=encoder,
+def load_model_classification(model_path):
+    model = FoldModelClassifier(
+        n_classes=3,
+        n_fold_classifier=3,
+        backbones=['ecaresnet26t.ra2_in1k', "seresnet50.a1_in1k", "resnet26t.ra2_in1k", "mobilenetv3_small_100.lamb_in1k", "efficientnet_b0.ra_in1k"],
+        features_size=256,
     )
-    model_classification.load_state_dict(torch.load(model_path, weights_only=True, map_location="cpu"))
-    return model_classification.eval().to(get_device())
+
+    model.load_state_dict(torch.load(model_path, weights_only=True, map_location="cpu"))
+    return model.eval().to(get_device())
 
 def load_torch_script_model(path):
     return torch.jit.load(path, map_location="cpu").eval().to(get_device())
@@ -150,6 +137,22 @@ def load_torch_script_model(path):
 #   SLICES SELECTION INFERENCE
 #
 ##########################################################
+
+def get_max_consecutive3(predictions):
+    index = 1
+    max_index = predictions.size(0) - 1
+    best_index = None
+    best_sum = -1
+    while index < max_index:
+        current_sum = predictions[index - 1] + predictions[index] + predictions[index + 1]
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_index = index
+        index += 1
+    
+    indices = [best_index-1, best_index, best_index+1]
+    values = [predictions[best_index-1], predictions[best_index], predictions[best_index+1]]
+    return values, indices
 
 def get_best_slice_selection(config, pathes, topk):
     """
@@ -175,15 +178,15 @@ def get_best_slice_selection(config, pathes, topk):
     ]
     for level in range(preds.shape[0]):
         pred_level = preds[level, :]
-        values, max_indice = torch.topk(pred_level, topk)
-        slices_by_level[level]['pathes'] = [pathes[i.item()] for i in max_indice]
-        slices_by_level[level]['values'] = [v.item() for v in values]
+        values, max_indice = get_max_consecutive3(pred_level)
+        slices_by_level[level]['pathes'] = [pathes[i] for i in max_indice]
+        slices_by_level[level]['values'] = [v for v in values]
 
     # get best overall (=> best after sum of each level)
-    values, max_indices = torch.topk(preds_overall, topk)
+    values, max_indices = get_max_consecutive3(preds_overall)
     best_slices_overall = dict()
-    best_slices_overall['pathes'] = [pathes[i.item()] for i in max_indices]
-    best_slices_overall['values'] = [v.item() for v in values]
+    best_slices_overall['pathes'] = [pathes[i] for i in max_indices]
+    best_slices_overall['values'] = [v for v in values]
 
     return slices_by_level, best_slices_overall
 
@@ -201,7 +204,7 @@ def get_slices_to_use(study_id, series_ids, config):
     # compute best slices for each series
     best_slices_per_series = dict()
     for s_id in slices_by_series:
-        best_slices, best_slices_overall = get_best_slice_selection(config, slices_by_series[s_id], topk=5)
+        best_slices, best_slices_overall = get_best_slice_selection(config, slices_by_series[s_id], topk=3)
         best_slices_per_series[s_id] = {
             "best_per_level": best_slices, 
             "best_overall": best_slices_overall,
@@ -260,24 +263,31 @@ def get_segmentation_input(slices_to_use: list, config: dict):
         images = torch.tensor(images).float().to(config["device"])
         return images
     elif config['segmentation_slice_selection'] == "best_by_level":
-        images = np.zeros((5, 1, *config['segmentation_input_shape']))
+        images = np.zeros((5, 3, *config['segmentation_input_shape']))
         for level in range(5):
-            slice_to_use = slices_to_use['best_by_level'][level][0] # 1 slice per level => the best one
-            im = cv2.resize(pydicom.dcmread(slice_to_use).pixel_array.astype(np.float32), 
-                            config['segmentation_input_shape'],
-                            interpolation=cv2.INTER_LINEAR
-                        )
-            im = (im - im.min()) / (im.max() - im.min() + 1e-9)
-            images[level, 0, ...] = im
-        images = torch.tensor(images).expand(5, 3, *config['segmentation_input_shape']).float().to(config["device"])
+            _slices_to_use = slices_to_use['best_by_level'][level][:3] # 3 slice per level => the best ones
+            _slices_to_use = sorted(_slices_to_use, key = lambda x: get_instance(x))
+            for ch, slice_to_use in enumerate(_slices_to_use):
+                im = cv2.resize(pydicom.dcmread(slice_to_use).pixel_array.astype(np.float32), 
+                                config['segmentation_input_shape'],
+                                interpolation=cv2.INTER_LINEAR
+                            )
+                im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+                images[level, ch, ...] = im
+        images = torch.tensor(images).float().to(config["device"])
         return images
     else:
         return None
 
 def get_position_by_level(slices_to_use: list, config: dict) -> dict:
     inputs = get_segmentation_input(slices_to_use, config)
-    masks = config["model_segmentation"](inputs.unsqueeze(0)).squeeze()
-    position_by_level = [find_center_of_largest_activation(masks[i]) for i in range(5)]
+    if config['segmentation_slice_selection'] == "best_overall":
+        masks = config["model_segmentation"](inputs.unsqueeze(0)).squeeze() # model predict 5 levels
+        position_by_level = [find_center_of_largest_activation(masks[i]) for i in range(5)]
+    else:
+        masks = config["model_segmentation"](inputs) # model predict 1 level, we put levels in batch dim
+        masks = masks.squeeze(1)
+        position_by_level = [find_center_of_largest_activation(masks[i]) for i in range(5)]
     return position_by_level
 
 ##########################################################
@@ -300,17 +310,18 @@ def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY
     return square
 
 def cut_crops(slices_path, x, y, crop_size, image_resize):
-    output_crops = np.zeros((len(slices_path), 1, *crop_size))
+    output_crops = np.zeros((len(slices_path), 224, 224))
     for k, slice_path in enumerate(slices_path):
         pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
         pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min() + 1e-9)
-        crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # reverse x y for cutting
-        output_crops[k, 0, ...] = crop
+        crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
+        crop = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR)
+        output_crops[k, ...] = crop
     return output_crops
 
 def get_crops_by_level(slices_to_use, position_by_level, config):
-    crops_output = np.zeros((5, 5, 1, *config['classification_input_size']))
+    crops_output = np.zeros((5, 3, 224, 224))
     for level, (slices_, position) in enumerate(zip(slices_to_use["best_by_level"], position_by_level)):
         if position is not None:
             slices = sorted(slices_[:config['classification_sequence_lenght']], key = lambda x : get_instance(x))
@@ -321,11 +332,10 @@ def get_crops_by_level(slices_to_use, position_by_level, config):
             print("No prediction on segmentation !", level)
 
     crops_output = torch.tensor(crops_output).float().to(config["device"])
-    crops_output = crops_output.expand(5, 5, 3, *config['classification_input_size'])
     return crops_output
 
 def get_classification(crops: torch.tensor, config):
-    preds, _ = config['model_classification'](crops)
+    preds = config['model_classification'](crops, mode="inference")
     preds = torch.softmax(preds, dim=1)
     return preds
 
@@ -348,10 +358,16 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict, study_id: int) ->
         
         positions_by_level = get_position_by_level(slices_to_use, config)
         crops_by_level = get_crops_by_level(slices_to_use, positions_by_level, config)
+        for level in range(5):
+            for i in range(3):
+                c = crops_by_level[level, i].detach().cpu().numpy()
+                cv2.imwrite(f"{config['condition']}_crop_{level}_{i}.jpg", c * 255)
         classification_results = get_classification(crops_by_level, config)
     except Exception as e:
         print(f"Error {study_id} {config['condition']}:", e)
         classification_results = None
+        import sys
+        sys.exit(1)
 
     predictions = list()
     row_id = f"{study_id}_{config['condition'].lower().replace(' ', '_')}"
@@ -383,74 +399,68 @@ def configure_inference(slice_model_path, seg_model_path, class_model, input_fol
         segmentation_slice_selection=seg_mode,
     )
 
-if __name__ == "__main__":
-    input_images_folder = "../REFAIT/train_images/"
-    df_description = pd.read_csv("../REFAIT/train_series_descriptions.csv")
+def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
+    df_description = pd.read_csv(description_file)
     final_predictions = []
 
     tasks = [
         {
-            "class_model_path": "trained_models/v1/model_classification_st2.pth",
-            "slice_model_path": "trained_models/v1/model_slice_selection_st2.ts",
-            "seg_model_path": "trained_models/v1/model_segmentation_st2.ts",
-            "encoder": "efficientnet",
+            "class_model_path": "trained_models/v2/model_classification_st2.pth",
+            "slice_model_path": "trained_models/v2/model_slice_selection_st2.ts",
+            "seg_model_path": "trained_models/v2/model_segmentation_st2.ts",
             "description": "Sagittal T2/STIR",
             "condition": "Spinal Canal Stenosis",
             "class_input_size": (96, 164),
-            "class_resize_image": (600, 600),
+            "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v1/model_classification_st1_left.pth",
-            "slice_model_path": "trained_models/v1/model_slice_selection_st1_left.ts",
-            "seg_model_path": "trained_models/v1/model_segmentation_st1_left.ts",
-            "encoder": "efficientnet",
-            "description": "Sagittal T1",
-            "condition": "Left Neural Foraminal Narrowing",
-            "class_input_size": (96, 164),
-            "class_resize_image": (600, 600),
-            "segmentation_slice_selection": "best_overall",
-        },
-        {
-            "class_model_path": "trained_models/v1/model_classification_st1_right.pth",
-            "slice_model_path": "trained_models/v1/model_slice_selection_st1_right.ts",
-            "seg_model_path": "trained_models/v1/model_segmentation_st1_right.ts",
-            "encoder": "efficientnet",
+            "class_model_path": "trained_models/v2/model_classification_st1_right.pth",
+            "slice_model_path": "trained_models/v2/model_slice_selection_st1_right.ts",
+            "seg_model_path": "trained_models/v2/model_segmentation_st1_right.ts",
             "description": "Sagittal T1",
             "condition": "Right Neural Foraminal Narrowing",
             "class_input_size": (96, 164),
-            "class_resize_image": (600, 600),
+            "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v1/model_classification_axt2_left.pth",
-            "slice_model_path": "trained_models/v1/model_slice_selection_axt2_left.ts",
-            "seg_model_path": "trained_models/v1/model_segmentation_axt2_left.ts",
-            "encoder": "efficientnet",
+            "class_model_path": "trained_models/v2/model_classification_st1_left.pth",
+            "slice_model_path": "trained_models/v2/model_slice_selection_st1_left.ts",
+            "seg_model_path": "trained_models/v2/model_segmentation_st1_left.ts",
+            "description": "Sagittal T1",
+            "condition": "Left Neural Foraminal Narrowing",
+            "class_input_size": (96, 164),
+            "class_resize_image": (640, 640),
+            "segmentation_slice_selection": "best_overall",
+        },
+        {
+            "class_model_path": "trained_models/v2/model_classification_axt2_right.pth",
+            "slice_model_path": "trained_models/v2/model_slice_selection_axt2_right.ts",
+            "seg_model_path": "trained_models/v2/model_segmentation_axt2_right.ts",
+            "description": "Axial T2",
+            "condition": "Right Subarticular Stenosis",
+            "class_input_size": (164, 164),
+            "class_resize_image": (800, 800),
+            "segmentation_slice_selection": "best_by_level",
+        },
+        {
+            "class_model_path": "trained_models/v2/model_classification_axt2_left.pth",
+            "slice_model_path": "trained_models/v2/model_slice_selection_axt2_left.ts",
+            "seg_model_path": "trained_models/v2/model_segmentation_axt2_left.ts",
             "description": "Axial T2",
             "condition": "Left Subarticular Stenosis",
             "class_input_size": (164, 164),
             "class_resize_image": (800, 800),
             "segmentation_slice_selection": "best_by_level",
         },
-        {
-            "class_model_path": "trained_models/v1/model_classification_axt2_right.pth",
-            "slice_model_path": "trained_models/v1/model_slice_selection_axt2_right.ts",
-            "seg_model_path": "trained_models/v1/model_segmentation_axt2_right.ts",
-            "encoder": "efficientnet",
-            "description": "Axial T2",
-            "condition": "Right Subarticular Stenosis",
-            "class_input_size": (164, 164),
-            "class_resize_image": (800, 800),
-            "segmentation_slice_selection": "best_by_level",
-        }
     ]
 
     studies_id = df_description["study_id"].unique()
     task_configs = []
     for task in tasks:
         print(f'Loading models and configuring for task: {task["condition"]}')
-        model_classification = load_model_classification(task["class_model_path"], encoder=task["encoder"])
+        model_classification = load_model_classification(task["class_model_path"])
         config = configure_inference(
             task["slice_model_path"],
             task["seg_model_path"],
@@ -464,10 +474,17 @@ if __name__ == "__main__":
         )
         task_configs.append(config)
 
-    for study_id in tqdm.tqdm(studies_id[225:226], desc="Predicting for each study"):
-        print(study_id)
+    if nb_studies_id is None:
+        nb_studies_id = len(studies_id)
+
+    print(f"Launch pipeline on {nb_studies_id} studies !")
+    for study_id in tqdm.tqdm(studies_id[:nb_studies_id], desc="Predicting for each study"):
         for config in task_configs:
             _predictions = predict_lumbar(df_description, config, study_id)
             final_predictions.extend(_predictions)
 
-    pd.DataFrame(final_predictions).to_csv("submission.csv", index=False)
+    return pd.DataFrame(final_predictions)
+
+if __name__ == "__main__":
+    df = compute_pipeline("../REFAIT/train_images/", "../REFAIT/train_series_descriptions.csv", 190)
+    df.to_csv("spinal_preds.csv")

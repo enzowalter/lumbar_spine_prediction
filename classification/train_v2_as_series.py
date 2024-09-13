@@ -7,13 +7,21 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import random
+import copy
 
 import glob
 import torch
 import warnings
 warnings.filterwarnings("ignore") # warning on lstm
 
-from models import EfficientNetClassifierFold
+from models import *
+from med3d import ResnetCropClassifier
+
+############################################################
+############################################################
+#          GEN DATASET UTILS
+############################################################
+############################################################
 
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
@@ -33,6 +41,7 @@ def get_best_slice_selection(slice_model, pathes, topk, device):
     for level in range(preds.shape[0]):
         pred_level = preds[level, :]
         _, max_indice = torch.topk(pred_level, topk)
+        #slices_by_level[level] = [pathes[i.item()] for i in max_indice]
         slices_by_level[level] = sorted([pathes[i.item()] for i in max_indice], key = lambda x : get_instance(x))
     return slices_by_level
 
@@ -50,8 +59,8 @@ def get_study_labels(study_id, df_study_labels, condition, levels, labels):
                 try:
                     final_labels[levels[level]] = labels[filtered_labels[item]]
                 except Exception as e: # sometimes labels are NaN
-                    print("Error", e)
-                    pass
+                    print("Error label", e)
+                    return None
 
     return final_labels
 
@@ -75,8 +84,15 @@ def cut_crops(slices_path, x, y, crop_size, image_resize):
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
         pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min() + 1e-9)
         crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
+        #crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_LINEAR)
         output_crops[k, ...] = crop
     return output_crops
+
+############################################################
+############################################################
+#          GEN DATASET
+############################################################
+############################################################
 
 def generate_dataset(input_dir, conditions, description, slice_model, crop_size, image_resize):
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
@@ -89,7 +105,7 @@ def generate_dataset(input_dir, conditions, description, slice_model, crop_size,
     studies_id = df_study_labels["study_id"].to_list()
 
     dataset = list()
-    for study_id in tqdm.tqdm(studies_id, desc="Generates segmentation masks"):
+    for study_id in tqdm.tqdm(studies_id, desc="Generates classification dataset"):
 
         series_id = df_study_descriptions[(df_study_descriptions['study_id'] == study_id)
                                         & (df_study_descriptions['series_description'] == description)]['series_id'].to_list()
@@ -102,84 +118,77 @@ def generate_dataset(input_dir, conditions, description, slice_model, crop_size,
             # add to dataset only if all vertebraes in gt
             if len(coordinates_dict) == len(LEVELS):
                 all_slices_path = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
-                slice_per_level = get_best_slice_selection(slice_model, all_slices_path, topk=3, device=device)
+                slice_per_level = get_best_slice_selection(slice_model, all_slices_path, topk=5, device=device)
                 gt_labels = get_study_labels(study_id, df_study_labels, conditions[0], LEVELS, LABELS)
 
-                for coordinate in coordinates_dict:
-                    try:
-                        idx_level = LEVELS[coordinate['level']]
-                        x, y = coordinate['x'], coordinate['y']
-                        original_shape = pydicom.dcmread(f"{input_dir}/train_images/{study_id}/{s_id}/{coordinate['instance_number']}.dcm").pixel_array.shape
-                        x = int((x / original_shape[1]) * image_resize[0]) 
-                        y = int((y / original_shape[0]) * image_resize[1])
+                if gt_labels is not None:
+                    for coordinate in coordinates_dict:
+                        try:
+                            idx_level = LEVELS[coordinate['level']]
+                            x, y = coordinate['x'], coordinate['y']
+                            original_shape = pydicom.dcmread(f"{input_dir}/train_images/{study_id}/{s_id}/{coordinate['instance_number']}.dcm").pixel_array.shape
+                            x = int((x / original_shape[1]) * image_resize[0]) 
+                            y = int((y / original_shape[0]) * image_resize[1])
 
-                        dataset_item = dict()
-                        dataset_item['study_id'] = study_id
-                        dataset_item['series_id'] = s_id
-                        dataset_item['slices_path'] = slice_per_level[idx_level]
-                        dataset_item['crops'] = cut_crops(slice_per_level[idx_level], x, y, crop_size, image_resize)
-                        dataset_item['gt_label'] = gt_labels[idx_level]
-                        dataset.append(dataset_item)
-                    except Exception as e:
-                        print("Error", e)
-                        continue
-
+                            dataset_item = dict()
+                            dataset_item['study_id'] = study_id
+                            dataset_item['series_id'] = s_id
+                            dataset_item['slices_path'] = slice_per_level[idx_level]
+                            dataset_item['position'] = (x, y)
+                            dataset_item['gt_label'] = gt_labels[idx_level]
+                            dataset_item['crop_size'] = crop_size
+                            dataset_item['image_resize'] = image_resize
+                            dataset.append(dataset_item)
+                        except Exception as e:
+                            print("Error add item", e)
+                            continue
     return dataset
 
-class SegmentationDataset(Dataset):
-    def __init__(self, infos):
+
+############################################################
+############################################################
+#          DATALOADER
+############################################################
+############################################################
+
+class CropClassifierDataset(Dataset):
+    def __init__(self, infos, is_train):
         self.datas = infos
+        aug_rate = 3
+        tmp_datas = list()
+        if is_train:
+            for data in self.datas:
+                tmp_datas.append(data)
+                if data['label'] != 0:
+                    for _ in range(aug_rate):
+                        new_item = copy.deepcopy(data)
+                        new_item['x'] += random.randint(-7, 7)
+                        new_item['y'] += random.randint(-7, 7)
+                        tmp_datas.append(new_item)
 
     def __len__(self):
         return len(self.datas)
 
     def __getitem__(self, idx):
         data = self.datas[idx]
-        images = data['crops']
-        images = torch.tensor(images).float()
-        return images, data['gt_label']
+        slices_to_use = data['slices_path']
+        #slices_path, x, y, crop_size, image_resize
+        x, y = data['position']
+        #dx = torch.randint(-7, 8, (1,)).item()
+        #dy = torch.randint(-7, 8, (1,)).item()
+        #x += dx
+        #y += dy
+        crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'])
+        crops = torch.tensor(crops).float().unsqueeze(1)
+        n, c, h, w = crops.shape
+        crops = crops.expand(n, 3, h, w).float()
+        return crops, data['gt_label']
 
-def validate_models(models, loader, criterion, device):
-    for m in models:
-        m = m.eval().to(device)
-    classification_loss_sum = 0
-    total_log_loss = 0
-    total_samples = 0
-    weights = np.array([1, 2, 4])
-
-    log_losses = np.array([0.4407276698279568, 0.38645598459473934, 0.4110739399380428])
-
-    model_weights = 1 / log_losses
-    model_weights /= model_weights.sum()
-
-    with torch.no_grad():
-        for im1, labels_gt in tqdm.tqdm(loader, desc="Valid"):
-            labels_gt = labels_gt.to(device).long()
-
-            final_output = torch.zeros(1, 3).to(device)
-            for m, w in zip(models, model_weights):
-                model_output = m(im1.to(device))
-                final_output += model_output * w
-
-            loss = criterion(final_output, labels_gt)
-            classification_loss_sum += loss.item()
-
-            probabilities = F.softmax(final_output, dim=1)
-            probabilities = torch.clamp(probabilities, min=1e-9, max=1 - 1e-9)
-            one_hot_labels = F.one_hot(labels_gt, num_classes=3).float()
-            log_loss_batch = -(one_hot_labels * torch.log(probabilities)).sum(dim=1)
-
-            weights_per_sample = weights[labels_gt.cpu().numpy()]
-            weighted_log_loss_batch = log_loss_batch.cpu().numpy() * weights_per_sample
-            total_log_loss += weighted_log_loss_batch.sum()
-            total_samples += labels_gt.size(0)
-
-        avg_classification_loss = classification_loss_sum / len(loader)
-        avg_log_loss = total_log_loss / total_samples
-
-    avg_classification_loss = classification_loss_sum / len(loader)
-    print({"loss": avg_classification_loss, "logloss": avg_log_loss})
-    return {"loss": avg_classification_loss, "logloss": avg_log_loss}
+############################################################
+############################################################
+#          TRAINING
+############################################################
+############################################################
 
 def calculate_log_loss(predictions, labels, weights, epsilon=1e-9):
     probabilities = torch.clamp(F.softmax(predictions, dim=1), min=epsilon, max=1 - epsilon)
@@ -239,24 +248,26 @@ def train_model(input_dir, conditions, description, slice_model_path, crop_size,
 
     dataset = generate_dataset(input_dir, conditions, description, slice_model, crop_size, image_resize)
     nb_valid = int(len(dataset) * 0.1)
-    train_dataset = SegmentationDataset(dataset[nb_valid:])
-    valid_dataset = SegmentationDataset(dataset[:nb_valid])
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
+    train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True)
+    valid_dataset = CropClassifierDataset(dataset[:nb_valid])
+    train_loader = DataLoader(train_dataset, batch_size=6, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
-    model = EfficientNetClassifierFold(n_fold=5, n_classes=3)
+    model = FoldModelClassifierFromSeries(
+        n_classes=3,
+        n_fold_classifier=5,
+        seq_lenght=5,
+        backbones=['ecaresnet26t.ra2_in1k', "seresnet50.a1_in1k", "resnet26t.ra2_in1k", "mobilenetv3_small_100.lamb_in1k", "efficientnet_b0.ra_in1k"],
+        features_size=128,
+    )
+
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=21e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=15, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
 
-    #models = list()
-    #for k in [1, 2, 3]:
-    #    models.append(torch.jit.load(f"model_classification_st2_{k}.ts"))
-
-    #validate_models(models, valid_loader, criterion, device)
-
-    best = 1234646
-    for epoch in range(8):
+    best = 123456
+    for epoch in range(20):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
@@ -265,10 +276,11 @@ def train_model(input_dir, conditions, description, slice_model_path, crop_size,
             best = metrics["logloss"]
             #model_scripted = torch.jit.script(model)
             #model_scripted.save(model_name)
-
+        
+        scheduler.step()
+        print("LR=", scheduler.get_last_lr())
         print("-" * 55)
     
-    print("-" * 55)
     print("-" * 55)
     print("-" * 55)
     print("DONE !")
@@ -276,7 +288,17 @@ def train_model(input_dir, conditions, description, slice_model_path, crop_size,
     print("Best metrics:", best)
     print("-" * 55)
     print("-" * 55)
-    print("-" * 55)
 
     torch.cuda.empty_cache()
     return best
+
+if __name__ == "__main__":
+    m2 = train_model(
+                "../../REFAIT",
+                ["Right Neural Foraminal Narrowing"],
+                "Sagittal T1",
+                "../trained_models/v0/model_slice_selection_st1_right.ts",
+                (96, 96),
+                (600, 600),
+                "model_classification_st1_right.ts",
+            ) # 0.645

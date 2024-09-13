@@ -11,7 +11,7 @@ from scipy.ndimage import label, center_of_mass
 import warnings
 warnings.filterwarnings("ignore") # warning on lstm
 
-from models import LumbarSegmentationModel
+from models_axial import LumbarSegmentationModelAxial
 
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
@@ -27,11 +27,11 @@ def get_best_slice_selection(slice_model, pathes, device):
         images[k, 0, ...] = im
     images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
     preds = slice_model(images.to(device).unsqueeze(0)).squeeze()
-    slices_to_ret = list()
+    slices_to_ret = dict()
     for level in range(preds.shape[0]):
         pred_level = preds[level, :]
-        _, max_indice = torch.topk(pred_level, 1)
-        slices_to_ret.append(pathes[max_indice.item()])
+        _, max_indices = torch.topk(pred_level, 3)
+        slices_to_ret[level] = sorted([pathes[i.item()] for i in max_indices], key = lambda x : get_instance(x))
     return slices_to_ret
 
 def find_center_of_largest_activation(mask):
@@ -69,25 +69,29 @@ def generate_dataset(input_dir, conditions, description, slice_model):
             # add to dataset only if all vertebraes in gt
             if len(coordinates_dict) == len(LEVELS):
                 dataset_item = dict()
-                dataset_item['study_id'] = study_id
-                dataset_item['series_id'] = s_id
-                dataset_item['all_slices_path'] = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
-                dataset_item['slice_per_level'] = get_best_slice_selection(slice_model, dataset_item['all_slices_path'], device)
-                dataset_item['output_mask'] = np.zeros((len(LEVELS), *MASK_SIZE))
-                dataset_item['gt_positions'] = [[None, None]] * len(LEVELS)
+                all_slices = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
+                slices_by_level = get_best_slice_selection(slice_model, all_slices, device)
 
                 for coordinate in coordinates_dict:
+                    # one entry by level
                     idx_level = LEVELS[coordinate['level']]
                     instance = coordinate['instance_number']
                     x, y = coordinate['x'], coordinate['y']
+
+                    dataset_item = dict()
+                    dataset_item['study_id'] = study_id
+                    dataset_item['series_id'] = s_id
+                    dataset_item['all_slices_path'] = all_slices
+                    dataset_item['slices_to_use'] = slices_by_level[idx_level]
 
                     original_slice = f"{input_dir}/train_images/{study_id}/{s_id}/{instance}.dcm"
                     original_shape = pydicom.dcmread(original_slice).pixel_array.shape
 
                     x = int((x / original_shape[1]) * MASK_SIZE[1])
                     y = int((y /original_shape[0]) * MASK_SIZE[0])
-                    dataset_item['gt_positions'][idx_level] = [x, y]
-                    dataset_item['output_mask'][idx_level][y-5:y+5,x-5:x+5] = 1
+                    dataset_item['gt_positions'] = [x, y]
+                    dataset_item['output_mask'] = np.zeros((MASK_SIZE[0], MASK_SIZE[1]))
+                    dataset_item['output_mask'][y-5:y+5,x-5:x+5] = 1
 
                 dataset.append(dataset_item)
     return dataset
@@ -102,16 +106,15 @@ class SegmentationDataset(Dataset):
     def __getitem__(self, idx):
         data = self.datas[idx]
 
-        slices_path = data['slice_per_level']
-        nb_slices = len(slices_path)
-        images = np.zeros((nb_slices, 1, 224, 224))
+        slices_path = data['slices_to_use']
+        images = np.zeros((3, 224, 224))
         for k, path in enumerate(slices_path):
             im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
                                            (224, 224),
                                            interpolation=cv2.INTER_LINEAR)
             im = (im - im.min()) / (im.max() - im.min() + 1e-9)
-            images[k, 0, ...] = im
-        images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
+            images[k, ...] = im
+        images = torch.tensor(images).float()
 
         return images, torch.tensor(data['output_mask']).float(), np.array(data['gt_positions'])  
 
@@ -119,10 +122,10 @@ def validate(model, loader, criterion, device):
     model.eval()
 
     valid_loss = 0
-    metrics = [{
+    metrics = {
         'dx': list(),
         'dy': list(),
-    } for _ in range(5)]
+    }
     nb_errors = 0
 
     for images, labels, gt_positions in tqdm.tqdm(loader, desc="Valid"):
@@ -130,44 +133,32 @@ def validate(model, loader, criterion, device):
             images = images.to(device)
             labels = labels.to(device)
             predictions = model(images)
-            loss = criterion(predictions, labels)
+            loss = criterion(predictions, labels.unsqueeze(1))
 
-            for level in range(5):
-                mask_ = predictions[:, level]
-                mask_ = mask_.squeeze()
-                pos_pred = find_center_of_largest_activation(mask_)
-                if pos_pred is not None:
-                    predx, predy = pos_pred
-                else:
-                    predx, predy = 1234, 1234
-                    nb_errors += 1
+            mask = predictions.squeeze()
+            pos_pred = find_center_of_largest_activation(mask)
+            if pos_pred is not None:
+                predx, predy = pos_pred
+            else:
+                predx, predy = 1234, 1234
+                nb_errors += 1
 
-                gt_posx, gt_posy = gt_positions[:, level].squeeze()
-                metrics[level]['dx'].append(abs(predx - gt_posx.item()))
-                metrics[level]['dy'].append(abs(predy - gt_posy.item()))
-
+            gt_posx, gt_posy = gt_positions.squeeze()
+            metrics['dx'].append(abs(predx - gt_posx.item()))
+            metrics['dy'].append(abs(predy - gt_posy.item()))
             valid_loss += loss.item() / len(loader)
 
-    for level in range(5):
-        metrics[level]['dx'] = sum(metrics[level]['dx']) / (len(metrics[level]['dx']) + 1e-9)
-        metrics[level]['dy'] = sum(metrics[level]['dy']) / (len(metrics[level]['dy']) + 1e-9)
-        metrics[level]['d_total'] = (metrics[level]['dx'] + metrics[level]['dy']) / 2
-
-    outputs = {
-        "dx": sum(metrics[i]['dx'] for i in range(5)) / 5,
-        "dy": sum(metrics[i]['dy'] for i in range(5)) / 5,
-    }
-    outputs['d_total'] = (outputs['dx'] + outputs['dy']) / 2
-    outputs['errors_percent'] = nb_errors / (len(loader) * 5)
-    outputs['nb_errors'] = nb_errors
+    metrics['dx'] = sum(metrics['dx']) / (len(metrics['dx']) + 1e-9)
+    metrics['dy'] = sum(metrics['dy']) / (len(metrics['dy']) + 1e-9)
+    metrics['d_total'] = (metrics['dx'] + metrics['dy']) / 2
+    metrics['errors_percent'] = nb_errors / (len(loader) * 5)
+    metrics['nb_errors'] = nb_errors
     
     print("-" * 50)
     print("VALIDATION")
-    for level in range(5):
-        print(f"\t{level}")
-        print(f"\t{metrics[level]}")
+    print("\t", metrics)
     print("-" * 50)
-    return valid_loss, outputs
+    return valid_loss, metrics
 
 def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
@@ -180,14 +171,14 @@ def train_epoch(model, loader, criterion, optimizer, device):
         labels = labels.to(device)
 
         predictions = model(images)
-        loss = criterion(predictions, labels)
+        loss = criterion(predictions, labels.unsqueeze(1))
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item() / len(loader)
 
     return epoch_loss
 
-def train_model(input_dir, conditions, description, slice_model_path, model_name):
+def train_model_axial(input_dir, conditions, description, slice_model_path, model_name):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     slice_model = torch.jit.load(slice_model_path, map_location='cpu')
@@ -201,7 +192,7 @@ def train_model(input_dir, conditions, description, slice_model_path, model_name
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
-    model = LumbarSegmentationModel()
+    model = LumbarSegmentationModelAxial()
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     criterion = torch.nn.BCELoss()

@@ -1,22 +1,34 @@
-from train import train_model
+from train_v2_original_slices import train_model
 
 if __name__ == "__main__":
+
+    m4 = train_model(
+                "../../REFAIT",
+                ["Right Subarticular Stenosis"],
+                "Axial T2",
+                "../trained_models/v0/model_slice_selection_axt2_right.ts",
+                (224, 224),
+                (800, 800),
+                "model_classification_axt2_right.pth",
+            )
+
     m1 = train_model(
                 "../../REFAIT",
                 ["Spinal Canal Stenosis"],
                 "Sagittal T2/STIR",
                 "../trained_models/v0/model_slice_selection_st2.ts",
-                (128, 256),
-                (700, 700),
-                "model_classification_st2.pth",
+                (96, 128),
+                (640, 640),
+                f"model_classification_st2.pth",
             )
+
     m2 = train_model(
                 "../../REFAIT",
                 ["Right Neural Foraminal Narrowing"],
                 "Sagittal T1",
                 "../trained_models/v0/model_slice_selection_st1_right.ts",
-                (128, 256),
-                (700, 700),
+                (96, 128),
+                (640, 640),
                 "model_classification_st1_right.pth",
             )
     m3 = train_model(
@@ -24,26 +36,17 @@ if __name__ == "__main__":
                 ["Left Neural Foraminal Narrowing"],
                 "Sagittal T1",
                 "../trained_models/v0/model_slice_selection_st1_left.ts",
-                (128, 256),
-                (700, 700),
+                (96, 128),
+                (640, 640),
                 "model_classification_st1_left.pth",
-            )
-    m4 = train_model(
-                "../../REFAIT",
-                ["Right Subarticular Stenosis"],
-                "Axial T2",
-                "../trained_models/v0/model_slice_selection_axt2_right.ts",
-                (224, 224),
-                (600, 600),
-                "model_classification_axt2_right.pth",
             )
     m5 = train_model(
                 "../../REFAIT",
                 ["Left Subarticular Stenosis"],
                 "Axial T2",
                 "../trained_models/v0/model_slice_selection_axt2_left.ts",
-                (224, 224),
-                (600, 600),
+                (164, 164),
+                (800, 800),
                 "model_classification_axt2_left.pth",
             )
     
