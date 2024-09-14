@@ -8,13 +8,9 @@ def main_train(label_condition):
 
 if __name__ == "__main__":
     b1 = main_train(label_condition="Spinal Canal Stenosis")
-
     b2 = main_train(label_condition="Left Neural Foraminal Narrowing")
-
     b3 = main_train(label_condition="Right Neural Foraminal Narrowing")
-
     b4 = main_train(label_condition="Left Subarticular Stenosis")
-
     b5 = main_train(label_condition="Right Subarticular Stenosis")
 
     print("B1=", b1)

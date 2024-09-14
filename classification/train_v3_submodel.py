@@ -196,7 +196,7 @@ def calculate_log_loss(predictions, labels, weights, epsilon=1e-9):
     weighted_log_loss_batch = log_loss_batch * torch.tensor(weights_per_sample, device=labels.device)
     return weighted_log_loss_batch
 
-def validate(model, loader, criterion, device):
+def validate(model, type, loader, criterion, device):
     model.eval()
     classification_loss_sum = 0
     total_log_loss = 0
@@ -206,7 +206,11 @@ def validate(model, loader, criterion, device):
     with torch.no_grad():
         for images, labels_gt in tqdm.tqdm(loader, desc="Valid"):
             labels_gt = labels_gt.to(device).long()
-            final_output = model(images.to(device), mode="valid")
+
+            if type == "fold":
+                final_output = model.forward_fold(images.to(device), mode="valid")
+            else:
+                final_output = model.forward_inference(images.to(device))
 
             i = torch.argmax(final_output, dim = 1)
             matrix[labels_gt.item(), i.item()] += 1
@@ -238,7 +242,7 @@ def validate(model, loader, criterion, device):
     print("Precision:", weighted_precision, "Recall:", weighted_recall, "F1:", weighted_f1_score)
     return {"loss": avg_classification_loss, "logloss": avg_log_loss}
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, type, loader, criterion, optimizer, device):
     model.train()
     epoch_loss = 0
     for images, labels in tqdm.tqdm(loader, desc="Training", total=len(loader)):
@@ -246,7 +250,11 @@ def train_epoch(model, loader, criterion, optimizer, device):
         images = images.to(device)
         labels = labels.to(device).long()
 
-        predictions = model(images.to(device), mode="train")
+        if type == "fold":
+            predictions = model.forward_fold(images.to(device), mode="train")
+        else:
+            predictions = model.forward_inference(images.to(device))
+
         loss = criterion(predictions, labels)
         loss.backward()
         optimizer.step()
@@ -264,10 +272,19 @@ def train_submodel(input_dir, crop_description, crop_condition, label_condition,
     nb_valid = int(len(dataset) * 0.1)
     train_dataset = CropClassifierDataset(dataset[nb_valid:])
     valid_dataset = CropClassifierDataset(dataset[:nb_valid])
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
     # get model
+    """
+    model = FoldModelClassifier(
+        n_classes=3,
+        n_fold_classifier=2,
+        backbones=['ecaresnet26t.ra2_in1k', "seresnet50.a1_in1k", "resnet26t.ra2_in1k", "mobilenetv3_small_100.lamb_in1k", "efficientnet_b0.ra_in1k"],
+        features_size=256,
+    )
+    """
+    
     model = FoldModelClassifier(
         n_classes=3,
         n_fold_classifier=2,
@@ -277,15 +294,15 @@ def train_submodel(input_dir, crop_description, crop_condition, label_condition,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    # train
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    # train with folding
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=20, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
     best = 123456
-    for epoch in range(15):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
-        metrics = validate(model, valid_loader, criterion, device)
-        print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
+    for epoch in range(10):
+        loss_train = train_epoch(model, "fold", train_loader, criterion, optimizer, device)
+        metrics = validate(model, "fold", valid_loader, criterion, device)
+        print("Epoch folding", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['logloss'] < best:
             print("New best model !", model_name)
             best = metrics["logloss"]
@@ -297,6 +314,32 @@ def train_submodel(input_dir, crop_description, crop_condition, label_condition,
     
     print("Best metrics:", best)
     print("-" * 55)
+
+    # train complete inference
+    for encoder in model.fold_backbones:
+        for param in encoder.parameters():
+            param.requires_grad = False
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=20, gamma=0.5)
+    criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
+    best = 123456
+    for epoch in range(10):
+        loss_train = train_epoch(model, "inference", train_loader, criterion, optimizer, device)
+        metrics = validate(model, "inference", valid_loader, criterion, device)
+        print("Epoch inference", epoch, "train_loss=", loss_train, "metrics=", metrics)
+        if metrics['logloss'] < best:
+            print("New best model !", model_name)
+            best = metrics["logloss"]
+            torch.save(model.state_dict(), model_name)
+        
+        scheduler.step()
+        print("LR=", scheduler.get_last_lr())
+        print("-" * 55)
+    
+    print("Best metrics:", best)
+    print("-" * 55)
+
 
     model.load_state_dict(torch.load(model_name))
     os.remove(model_name)
@@ -330,9 +373,11 @@ def train_all_submodels(input_dir, label_condition):
                     image_resize=ir,
         )
         models.append(m)
+        break
+
     return models
 
 if __name__ == "__main__":
-    submodels = train_all_submodels(input_dir="../../REFAIT", label_condition="Spinal Canal Stenosis")
+    submodels = train_all_submodels(input_dir="../../REFAIT", label_condition="Left Neural Foraminal Narrowing")
     for model in submodels:
         torch.save(submodels[model].state_dict(), f"test_submodel_{model}.pth")

@@ -297,6 +297,25 @@ class DynamicModelLoader:
 ###############################################################################
 ###############################################################################
 
+class FoldEncoderAttention(nn.Module):
+    def __init__(self, features):
+        super().__init__()
+        self.query = nn.Linear(features, features)
+        self.key = nn.Linear(features, features)
+        self.value = nn.Linear(features, features)
+        self.softmax = nn.Softmax(dim=1)
+    
+    def forward(self, encoded):
+        query = self.query(encoded)
+        key = self.key(encoded)
+        value = self.value(encoded)
+
+        attention_scores = torch.einsum('bsf,bsf->bs', query, key) / (encoded.size(-1) ** 0.5)
+        attention_weights = self.softmax(attention_scores)
+        weighted_sum = torch.einsum('bsf,bs->bf', value, attention_weights)
+
+        return weighted_sum
+
 class FoldEncoder(nn.Module):
     def __init__(self, features_size, backbone_name):
         super().__init__()
@@ -333,11 +352,15 @@ class FoldModelClassifier(nn.Module):
             FoldClassifier(features_size, n_classes) for _ in range(n_fold_classifier)
         ])
 
+        self.encoders_attention = FoldEncoderAttention(256)
+        self.classifier_weight = nn.Parameter(torch.tensor([1. for _ in range(self.n_fold_cla)], dtype=torch.float32))
+
+
     def forward_encoders(self, crop):
         encodeds = torch.stack([backbone(crop) for backbone in self.fold_backbones], dim=1)
         return encodeds
 
-    def forward(self, crop, mode):
+    def forward_fold(self, crop, mode):
         if mode == "train":
             r_b = torch.randint(0, self.n_fold_enc, (1,)).item()
             backbone = self.fold_backbones[r_b]
@@ -360,6 +383,15 @@ class FoldModelClassifier(nn.Module):
             final_output = torch.stack(final_output, dim=1)
             final_output = torch.mean(final_output, dim=1)
             return final_output
+
+    def forward_inference(self, crop):
+        _encodeds = self.forward_encoders(crop)
+        _encodeds = self.encoders_attention(_encodeds)
+        classifieds = torch.stack([classifier(_encodeds) for classifier in self.fold_classifiers], dim = 1)
+        classification_weights = torch.softmax(self.classifier_weight, dim = 0)
+        outputs = torch.einsum("bsf, s -> bf", classifieds, classification_weights)
+        return outputs
+
 
 ###############################################################################
 ###############################################################################
@@ -405,8 +437,8 @@ class FoldEncoderSeries(nn.Module):
             encodeds.append(self.model(x[:, n]))
         encodeds = torch.stack(encodeds, dim = 1) # => b, s, f
         lstm_out, _ = self.lstm(encodeds) # b s f
-        lstm_out, attention_weight = self.sequence_reducer(lstm_out) # b f
-        return lstm_out, attention_weight
+        lstm_out = self.sequence_reducer(lstm_out) # b f
+        return lstm_out
 
 class FoldModelClassifierFromSeries(nn.Module):
     def __init__(self, n_fold_classifier, backbones, seq_lenght, features_size, n_classes):
@@ -431,9 +463,9 @@ class FoldModelClassifierFromSeries(nn.Module):
             r_c = torch.randint(0, self.n_fold_cla, (1,)).item()
             classifier = self.fold_classifiers[r_c]
     
-            encoded, attention_weight = backbone(crop)
+            encoded = backbone(crop)
             output = classifier(encoded)
-            return output, attention_weight
+            return output
 
         if mode == "valid" or mode == "inference":
             final_output = list()
@@ -449,9 +481,38 @@ class FoldModelClassifierFromSeries(nn.Module):
 
 ###############################################################################
 ###############################################################################
-# EfficientNet Classification
+# Basic Classification
 ###############################################################################
 ###############################################################################
+
+class Resnet3dClassification(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = torchvision.models.video.r3d_18(weights="DEFAULT")
+        self.pooler = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3)
+        )
+    
+    def forward_features(self, x):
+        x = self.backbone.stem(x)
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+        x = self.backbone.avgpool(x)
+        x = x.flatten(1)
+        return x
+
+    def forward(self, x):
+        b, s, h, w = x.size()
+        x = x.unsqueeze(1)
+        x = x.expand(b, 3, s, h, w)
+        x = self.forward_features(x)
+        x = self.classifier(x)
+        return x
 
 class EfficientNetClassification(nn.Module):
     def __init__(self):
@@ -464,22 +525,21 @@ class EfficientNetClassification(nn.Module):
             nn.Linear(512, 3)
         )
     
-    def forward(self, x):
+    def forward_features(self, x):
         x = self.backbone.features(x)
         x = self.pooler(x)
         x = x.view(x.shape[0], -1)
+        return x
+
+    def forward(self, x):
+        x = self.forward_features(x)
         x = self.classifier(x)
         return x
-import torchvision
-import timm
 
 class SEResNetClassification(nn.Module):
     def __init__(self, num_classes=3):
         super(SEResNetClassification, self).__init__()
-        # Load pretrained SE-ResNet50 model from timm
         self.backbone = timm.create_model('seresnet50', pretrained=True)
-        
-        # Replace the final fully connected layer for your classification task
         in_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Sequential(
             nn.Linear(in_features, 512),
@@ -489,3 +549,4 @@ class SEResNetClassification(nn.Module):
     
     def forward(self, x):
         return self.backbone(x)
+    
