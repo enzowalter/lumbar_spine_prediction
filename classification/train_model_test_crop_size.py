@@ -263,7 +263,7 @@ def train_submodel_test_slice(input_dir, model_name, crop_description, crop_cond
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=20, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
     best = 123456
-    for epoch in range(8):
+    for epoch in range(20):
         loss_train = train_epoch(model, "fold", train_loader, criterion, optimizer, device)
         metrics = validate(model, "fold", valid_loader, criterion, device)
         print("Epoch folding", epoch, "train_loss=", loss_train, "metrics=", metrics)

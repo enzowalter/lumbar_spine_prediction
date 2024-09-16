@@ -319,6 +319,7 @@ class FoldModelClassifier(nn.Module):
     def forward_fold(self, crop, mode):
         if mode == "train":
             r_b = torch.randint(0, self.n_fold_enc, (1,)).item()
+            #r_c = torch.randint(0, self.n_fold_cla, (1,)).item()
             backbone = self.fold_backbones[r_b]
             classifier = self.fold_classifiers[r_b]
     
@@ -327,7 +328,7 @@ class FoldModelClassifier(nn.Module):
             return output
 
         if mode == "valid" or mode == "inference":
-            """
+            '''
             final_output = list()
             _encodeds = self.forward_encoders(crop)
             for classifier in self.fold_classifiers:
@@ -338,7 +339,7 @@ class FoldModelClassifier(nn.Module):
             final_output = torch.stack(final_output, dim=1)
             final_output = torch.mean(final_output, dim=1)
             return final_output
-            """
+            '''
             final_output = list()
             for i in range(self.n_fold_enc):
                 enc = self.fold_backbones[i](crop)
@@ -449,6 +450,74 @@ class FoldModelClassifierFromSeries(nn.Module):
 
 ###############################################################################
 ###############################################################################
+# Models Dual Output
+###############################################################################
+###############################################################################
+
+class MaskGenerator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.main = nn.Sequential(
+            # 7 7
+            nn.ConvTranspose2d(2048, 1024, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(0.021),
+            # 14 14
+            nn.ConvTranspose2d(1024, 512, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.021),
+            # 28 28
+            nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.021),
+            # 56 56
+        )
+        self.outconv = nn.Sequential(
+            nn.Conv2d(256, 128, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 5, 1, 1, 0)
+        )
+    def forward(self, x):
+        x = self.main(x)
+        x = F.interpolate(x, size=(96, 96), mode="bilinear")
+        x = self.outconv(x)
+        return x.sigmoid()
+
+
+class MobileNetDualOutput(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = torchvision.models.resnet50(weights="DEFAULT")
+        self.mask_generator = MaskGenerator()
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(start_dim=1),
+            nn.Linear(2048, 512),
+            nn.ReLU(),
+            nn.Linear(512, 15)
+        )
+
+    def forward_features(self, x):
+        x = self.model.conv1(x)
+        x = self.model.bn1(x)
+        x = self.model.relu(x)
+        x = self.model.maxpool(x)
+
+        x = self.model.layer1(x)
+        x = self.model.layer2(x)
+        x = self.model.layer3(x)
+        x = self.model.layer4(x)
+        return x  
+
+    def forward(self, x):
+        features = self.forward_features(x)
+        mask = self.mask_generator(features)
+        labels = self.classifier(features)
+        return labels, mask
+
+###############################################################################
+###############################################################################
 # Basic Classification Models
 ###############################################################################
 ###############################################################################
@@ -463,6 +532,7 @@ class SimpleClassifier(nn.Module):
         x = self.model(x)
         x = self.classifier(x)
         return x
+
 
 class Resnet3dClassification(nn.Module):
     def __init__(self):

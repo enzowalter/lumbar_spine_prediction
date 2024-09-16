@@ -45,30 +45,6 @@ def get_study_labels(study_id, df_study_labels, condition, levels, labels):
 
     return final_labels
 
-def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY):
-    square = np.zeros((sizeX, sizeY), dtype=array.dtype)
-    start_x = max(center_x - (sizeX // 2), 0)
-    end_x = min(center_x + (sizeX // 2), array.shape[0])
-    start_y = max(center_y - (sizeY // 2), 0)
-    end_y = min(center_y + (sizeY // 2), array.shape[1])
-    out_start_x = (sizeX // 2) - (center_x - start_x)
-    out_end_x = out_start_x + (end_x - start_x)
-    out_start_y = (sizeY // 2) - (center_y - start_y)
-    out_end_y = out_start_y + (end_y - start_y)
-    square[out_start_x:out_end_x, out_start_y:out_end_y] = array[start_x:end_x, start_y:end_y]
-    return square
-
-def cut_crops(slices_path, x, y, crop_size, image_resize):
-    output_crops = np.zeros((len(slices_path), 128, 128))
-    for k, slice_path in enumerate(slices_path):
-        pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
-        pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
-        pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min() + 1e-9)
-        crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
-        crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_LINEAR)
-        output_crops[k, ...] = crop
-    return output_crops
-
 ############################################################
 ############################################################
 #          GEN DATASET
@@ -145,12 +121,125 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
 def tensor_augmentations(tensor_image):
     angle = random.uniform(-15, 15)
     tensor_image = FT.rotate(tensor_image, angle)
+
+    #tensor_image = FT.adjust_brightness(tensor_image, brightness_factor=random.uniform(0.9, 1.1))
+    #tensor_image = FT.adjust_contrast(tensor_image, contrast_factor=random.uniform(0.9, 1.1))
+    #tensor_image = FT.adjust_saturation(tensor_image, saturation_factor=random.uniform(0.9, 1.1))
+    #tensor_image = FT.adjust_hue(tensor_image, hue_factor=random.uniform(-0.05, 0.05))
+
+    noise = torch.randn(tensor_image.size()) * 0.01
+    tensor_image = tensor_image + noise
+
     return tensor_image
 
+def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY):
+    square = np.zeros((sizeX, sizeY), dtype=array.dtype)
+    start_x = max(center_x - (sizeX // 2), 0)
+    end_x = min(center_x + (sizeX // 2), array.shape[0])
+    start_y = max(center_y - (sizeY // 2), 0)
+    end_y = min(center_y + (sizeY // 2), array.shape[1])
+    out_start_x = (sizeX // 2) - (center_x - start_x)
+    out_end_x = out_start_x + (end_x - start_x)
+    out_start_y = (sizeY // 2) - (center_y - start_y)
+    out_end_y = out_start_y + (end_y - start_y)
+    square[out_start_x:out_end_x, out_start_y:out_end_y] = array[start_x:end_x, start_y:end_y]
+    return square
+
+def z_score_normalization(image):
+    mean = image.mean()
+    std = image.std()
+    return (image - mean) / std
+
+def clahe_equalization(image, clip_limit=2.0, grid_size=(8, 8)):
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    image = np.uint8(image)
+    return clahe.apply(image)
+
+def clahe_equalization_norm2(image, clip_limit=2.0, grid_size=(8, 8)):
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    image = (image - image.min()) / (image.max() - image.min())
+    image = image * 255.
+    image = image.astype(np.uint8)
+    image = clahe.apply(image)
+    image = image.astype(np.float32)
+    image = image / 255.
+    return image
+
+def clahe_equalization_norm(image, clip_limit=2.0, grid_size=(8, 8)):
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    image = np.uint8(image)
+    image = clahe.apply(image)
+    image = image.astype(np.float32)
+    image = (image - image.min()) / (image.max() - image.min())
+    return image
+
+def compute_dahe(image):
+    image = (image - image.min()) / (image.max() - image.min())
+    image = image * 255.
+    image = image.astype(np.uint8)
+    hist_original = cv2.calcHist([image], [0], None, [256], [0, 256]).flatten()
+    img_eq = cv2.equalizeHist(image)
+    hist_eq = cv2.calcHist([img_eq], [0], None, [256], [0, 256]).flatten()
+    hist_diff = np.abs(hist_original - hist_eq)
+    hist_diff = hist_diff.astype(np.float32)
+    hist_diff_normalized = hist_diff / np.max(hist_diff)
+    return hist_diff_normalized
+
+def laplacian_norm_filter(image):
+    image = image.astype(np.int16)
+    laplacian = cv2.Laplacian(image, cv2.CV_64F)
+    image = laplacian.astype(np.float32)
+    image = (image - image.min()) / (image.max() - image.min())
+    return image
+
+def laplacian_norm_filter2(image):
+    image = image.astype(np.int16)
+    laplacian = cv2.Laplacian(image, cv2.CV_64F)
+    image = laplacian.astype(np.float32)
+    image = image / 255.
+    return image
+
+def laplacian_filter(image):
+    image = image.astype(np.int16)
+    laplacian = cv2.Laplacian(image, cv2.CV_64F)
+    return laplacian
+
+def cut_crops(slices_path, x, y, crop_size, image_resize, normalisation):
+    output_crops = np.zeros((len(slices_path), 128, 128))
+    for k, slice_path in enumerate(slices_path):
+        pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
+        pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
+        if normalisation == "min_max_slice":
+            pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min() + 1e-9)
+        crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
+        if normalisation == "min_max_crop":
+            crop = (crop - crop.min()) / (crop.max() - crop.min() + 1e-9)
+        elif normalisation == "laplacian":
+            crop = laplacian_filter(crop)
+        elif normalisation == "laplacian_norm":
+            crop = laplacian_norm_filter(crop)
+        elif normalisation == "laplacian_norm_2":
+            crop = laplacian_norm_filter2(crop)
+        elif normalisation == "clahe":
+            crop = clahe_equalization(crop)
+        elif normalisation == "clahe_norm":
+            crop = clahe_equalization_norm(crop)
+        elif normalisation == "clahe_norm_2":
+            crop = clahe_equalization_norm2(crop)
+        elif normalisation == "clahe_norm_gpt":
+            crop = compute_dahe(crop)
+        elif normalisation == "zscore":
+            crop = z_score_normalization(crop)
+
+        crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_LINEAR)
+        output_crops[k, ...] = crop
+    return output_crops
+
 class CropClassifierDataset(Dataset):
-    def __init__(self, infos, is_train=False):
+    def __init__(self, infos, normalisation, is_train=False):
         self.datas = infos
         self.is_train = is_train
+        self.normalisation=normalisation
 
     def __len__(self):
         return len(self.datas)
@@ -159,11 +248,13 @@ class CropClassifierDataset(Dataset):
         data = self.datas[idx]
         slices_to_use = [data['slice_path']]
         x, y = data['position']
-        crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'])
+        crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'], normalisation=self.normalisation)
         crops = torch.tensor(crops).float()
         crops = crops.expand(3, 128, 128)
-        if self.is_train:
-            crops = tensor_augmentations(crops)
+
+        # NO AUG
+        #if self.is_train:
+        #    crops = tensor_augmentations(crops)
         return crops, data['gt_label']
 
 ############################################################
@@ -180,7 +271,7 @@ def calculate_log_loss(predictions, labels, weights, epsilon=1e-9):
     weighted_log_loss_batch = log_loss_batch * torch.tensor(weights_per_sample, device=labels.device)
     return weighted_log_loss_batch
 
-def validate(model, loader, criterion, device):
+def validate(model, type, loader, criterion, device):
     model.eval()
     classification_loss_sum = 0
     total_log_loss = 0
@@ -191,7 +282,10 @@ def validate(model, loader, criterion, device):
         for images, labels_gt in tqdm.tqdm(loader, desc="Valid"):
             labels_gt = labels_gt.to(device).long()
 
-            final_output = model(images.to(device))
+            if type == "fold":
+                final_output = model.forward_fold(images.to(device), mode="valid")
+            else:
+                final_output = model.forward_inference(images.to(device))
 
             i = torch.argmax(final_output, dim = 1)
             matrix[labels_gt.item(), i.item()] += 1
@@ -223,7 +317,7 @@ def validate(model, loader, criterion, device):
     print("Precision:", weighted_precision, "Recall:", weighted_recall, "F1:", weighted_f1_score)
     return {"loss": avg_classification_loss, "logloss": avg_log_loss}
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, type, loader, criterion, optimizer, device):
     model.train()
     epoch_loss = 0
     for images, labels in tqdm.tqdm(loader, desc="Training", total=len(loader)):
@@ -231,7 +325,10 @@ def train_epoch(model, loader, criterion, optimizer, device):
         images = images.to(device)
         labels = labels.to(device).long()
 
-        predictions = model(images.to(device))
+        if type == "fold":
+            predictions = model.forward_fold(images.to(device), mode="train")
+        else:
+            predictions = model.forward_inference(images.to(device))
 
         loss = criterion(predictions, labels)
         loss.backward()
@@ -241,63 +338,68 @@ def train_epoch(model, loader, criterion, optimizer, device):
     return epoch_loss
 
 
-def train_submodel_test_encoder(input_dir, model_name, crop_description, crop_condition, label_condition, crop_size, image_resize, encoder_name):
+def train_submodel_test_slice(input_dir, model_name, crop_description, crop_condition, label_condition, crop_size, image_resize, normalisation):
 
     # get dataset
     dataset = generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize)
     nb_valid = int(len(dataset) * 0.1)
-    train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True)
-    valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True, normalisation=normalisation)
+    valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False, normalisation=normalisation)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
     # get model
-    model = SimpleClassifier(encoder_name)
-
+    model = FoldModelClassifier(
+        n_classes=3,
+        n_fold_classifier=5,
+        backbones=['ecaresnet26t.ra2_in1k', "seresnet50.a1_in1k", "resnet26t.ra2_in1k", "mobilenetv3_small_100.lamb_in1k", "efficientnet_b0.ra_in1k"],
+        features_size=256,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     # train with folding
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=5, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=20, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
     best = 123456
-    for epoch in range(8):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
-        metrics = validate(model, valid_loader, criterion, device)
-        print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
+    for epoch in range(10):
+        loss_train = train_epoch(model, "fold", train_loader, criterion, optimizer, device)
+        metrics = validate(model, "fold", valid_loader, criterion, device)
+        print("Epoch folding", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['logloss'] < best:
             print("New best model !", model_name)
             best = metrics["logloss"]
+
         scheduler.step()
     return best
 
 if __name__ == "__main__":
         
-    encoders = [
-        #'densenet201.tv_in1k',
-        #'seresnext101_32x4d.gluon_in1k',
-        'resnest101e.in1k',
-        #'ecaresnet50d.miil_in1k',
-        #'mobilenetv3_large_100.ra_in1k',
-        'rexnet_300.nav_in1k',
-        'skresnet34.ra_in1k',
-        'rexnet_150.nav_in1k',
+    normalisations = [
+        #"min_max_slice",
+        #"min_max_crop",
+        #"laplacian",
+        #"laplacian_norm",
+        #"laplacian_norm_2",
+        #"clahe",
+        #"clahe_norm",
+        "clahe_norm_2",
+        #"clahe_norm_gpt",
+        #"zscore",
     ]
-    metrics = dict()
-    for encoder in encoders:
-        print("Testing:", encoder)
-        best_logloss = train_submodel_test_encoder(
-                        input_dir="../../REFAIT/",
+
+    for normalisation in normalisations:
+        print("Testing:", normalisation)
+        best_logloss = train_submodel_test_slice(
+                        input_dir="../../REFAIT",
                         model_name="classification_left_neural_foraminal_narrowing.pth",
                         crop_condition="Left Neural Foraminal Narrowing",
                         label_condition="Left Neural Foraminal Narrowing",
                         crop_description="Sagittal T1",
                         crop_size=(64, 96),
                         image_resize=(640, 640),
-                        encoder_name=encoder,
+                        normalisation=normalisation
         )
-
-        metrics[encoder] = best_logloss
-    
-    print(metrics)
+        print("Best metric:", best_logloss)
+        print("-" * 50)

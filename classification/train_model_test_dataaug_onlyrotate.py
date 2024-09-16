@@ -270,17 +270,12 @@ def train_submodel_test_slice(input_dir, model_name, crop_description, crop_cond
     # get model
     model = FoldModelClassifier(
         n_classes=3,
-        n_fold_classifier=6,
-        backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k', 'vit_small_patch16_224.augreg_in21k_ft_in1k'],
+        n_fold_classifier=5,
+        backbones=['ecaresnet26t.ra2_in1k', "seresnet50.a1_in1k", "resnet26t.ra2_in1k", "mobilenetv3_small_100.lamb_in1k", "efficientnet_b0.ra_in1k"],
         features_size=256,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
-    # xception Y
-    # efficient b3 NO
-    # inception NO
-
 
     # train with folding
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)

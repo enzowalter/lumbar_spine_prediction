@@ -58,13 +58,20 @@ def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY
     square[out_start_x:out_end_x, out_start_y:out_end_y] = array[start_x:end_x, start_y:end_y]
     return square
 
+def clahe_equalization_norm2(image, clip_limit=2.0, grid_size=(8, 8)):
+    image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    image = clahe.apply(np.uint8(image))
+    image = image.astype(np.float32) / 255.
+    return image
+
 def cut_crops(slices_path, x, y, crop_size, image_resize):
     output_crops = np.zeros((len(slices_path), 224, 224))
     for k, slice_path in enumerate(slices_path):
         pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
         crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
-        crop = (crop - crop.min()) / (crop.max() - crop.min() + 1e-9)
+        crop = clahe_equalization_norm2(crop)
         crop = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR)
         output_crops[k, ...] = crop
     return output_crops
@@ -152,19 +159,11 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
 ############################################################
 
 def tensor_augmentations(tensor_image):
-    angle = random.uniform(-15, 15)
+    angle = random.uniform(-10, 10)
     tensor_image = FT.rotate(tensor_image, angle)
-
-    tensor_image = FT.adjust_brightness(tensor_image, brightness_factor=random.uniform(0.9, 1.1))
-    tensor_image = FT.adjust_contrast(tensor_image, contrast_factor=random.uniform(0.9, 1.1))
-    tensor_image = FT.adjust_saturation(tensor_image, saturation_factor=random.uniform(0.9, 1.1))
-    tensor_image = FT.adjust_hue(tensor_image, hue_factor=random.uniform(-0.05, 0.05))
-
     noise = torch.randn(tensor_image.size()) * 0.01
     tensor_image = tensor_image + noise
-
     return tensor_image
-
 
 class CropClassifierDataset(Dataset):
     def __init__(self, infos, is_train=False):
@@ -176,11 +175,10 @@ class CropClassifierDataset(Dataset):
 
     def __getitem__(self, idx):
         data = self.datas[idx]
-        slices_to_use = [data['slice_path']]
+        slices_to_use = data['slices_path']
         x, y = data['position']
         crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'])
         crops = torch.tensor(crops).float()
-        crops = crops.expand(3, 224, 224)
         if self.is_train:
             crops = tensor_augmentations(crops)
         return crops, data['gt_label']
@@ -279,7 +277,7 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     # get model
     model = FoldModelClassifier(
         n_classes=3,
-        n_fold_classifier=6,
+        n_fold_classifier=3,
         backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k', 'vit_small_patch16_224.augreg_in21k_ft_in1k'],
         features_size=256,
     )
