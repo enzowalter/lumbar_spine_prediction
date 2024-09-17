@@ -47,7 +47,7 @@ def find_center_of_largest_activation(mask):
 
 def generate_dataset(input_dir, conditions, description, slice_model):
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
-    MASK_SIZE = (96, 96)
+    MASK_SIZE = (384, 384)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     df_study_labels = pd.read_csv(f"{input_dir}/train.csv")
@@ -91,7 +91,7 @@ def generate_dataset(input_dir, conditions, description, slice_model):
                     y = int((y /original_shape[0]) * MASK_SIZE[0])
                     dataset_item['gt_positions'] = [x, y]
                     dataset_item['output_mask'] = np.zeros((MASK_SIZE[0], MASK_SIZE[1]))
-                    dataset_item['output_mask'][y-5:y+5,x-5:x+5] = 1
+                    dataset_item['output_mask'][y-8:y+8,x-8:x+8] = 1
 
                 dataset.append(dataset_item)
     return dataset
@@ -107,10 +107,10 @@ class SegmentationDataset(Dataset):
         data = self.datas[idx]
 
         slices_path = data['slices_to_use']
-        images = np.zeros((3, 224, 224))
+        images = np.zeros((3, 384, 384))
         for k, path in enumerate(slices_path):
             im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
-                                           (224, 224),
+                                           (384, 384),
                                            interpolation=cv2.INTER_LINEAR)
             im = (im - im.min()) / (im.max() - im.min() + 1e-9)
             images[k, ...] = im
@@ -194,12 +194,12 @@ def train_model_axial(input_dir, conditions, description, slice_model_path, mode
 
     model = LumbarSegmentationModelAxial()
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005)
     criterion = torch.nn.BCELoss()
 
     best_metrics = None
     best = 123456
-    for epoch in range(8):
+    for epoch in range(20):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
         loss_valid, metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "valid_loss=", loss_valid, "metrics=", metrics)
@@ -221,3 +221,20 @@ def train_model_axial(input_dir, conditions, description, slice_model_path, mode
     print("-" * 55)
     print("-" * 55)
     return best_metrics
+
+
+if __name__ == "__main__":
+    m4 = train_model_axial(
+                "../../REFAIT",
+                ["Right Subarticular Stenosis"],
+                "Axial T2",
+                "../trained_models/v1/model_slice_selection_axt2_right.ts",
+                "model_segmentation_axt2_right_384x384.ts",
+            )
+    m5 = train_model_axial(
+                "../../REFAIT",
+                ["Left Subarticular Stenosis"],
+                "Axial T2",
+                "../trained_models/v1/model_slice_selection_axt2_left.ts",
+                "model_segmentation_axt2_left_384x384.ts",
+            )

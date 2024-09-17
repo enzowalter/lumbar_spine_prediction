@@ -312,7 +312,8 @@ def get_segmentation_input(slices_to_use: list, config: dict):
 def get_position_by_level(slices_to_use: list, config: dict) -> dict:
     inputs = get_segmentation_input(slices_to_use, config)
     if config['segmentation_slice_selection'] == "best_overall":
-        masks = config["model_segmentation"](inputs.unsqueeze(0)).squeeze() # model predict 5 levels
+        masks = config["model_segmentation"](inputs.unsqueeze(0)) # model predict 5 levels
+        masks = masks.squeeze()
         position_by_level = [find_center_of_largest_activation(masks[i]) for i in range(5)]
     else:
         masks = config["model_segmentation"](inputs) # model predict 1 level, we put levels in batch dim
@@ -362,7 +363,6 @@ def get_crops_by_level(slices_to_use, position_by_level, config):
     for level, (slices_, position) in enumerate(zip(slices_to_use["best_by_level"], position_by_level)):
         if position is not None:
             slices = sorted(slices_[:config['classification_sequence_lenght']], key = lambda x : get_instance(x))
-
             # test position
             # s_test = slices_[:config['classification_sequence_lenght']][0]
             # shape_test = pydicom.dcmread(s_test).pixel_array.shape
@@ -401,16 +401,16 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict, study_id: int) ->
             best_overall=best_slices_overall
         )
         
-        #print(slices_to_use)
+        # print(slices_to_use)
 
         positions_by_level = get_position_by_level(slices_to_use, config)
 
-        #print(positions_by_level)
+        # print(positions_by_level)
 
         crops_by_level = get_crops_by_level(slices_to_use, positions_by_level, config)
         classification_results = get_classification(crops_by_level, config)
 
-        #print(classification_results)
+        # print(classification_results)
 
     except Exception as e:
         print(f"Error {study_id} {config['condition']}:", e)
@@ -431,19 +431,26 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict, study_id: int) ->
 def configure_inference(slice_model_path, seg_model_path, class_model, input_folder, description, condition, class_input_size, class_resize_image, seg_mode):
     return dict(
         device=get_device(),
+
+        # slices infos
         model_slice_selection=load_torch_script_model(slice_model_path),
-        model_segmentation=load_torch_script_model(seg_model_path),
-        model_classification=class_model,
         slice_selection_input_shape=(224, 224),
-        segmentation_input_shape=(224, 224),
-        segmentation_mask_shape=(96, 96),
+
+        # segmentation infos
+        segmentation_input_shape=(384, 384),
+        segmentation_slice_selection=seg_mode,
+        model_segmentation=load_torch_script_model(seg_model_path),
+
+        # classification infos
         classification_input_size=class_input_size,
         classification_resize_image=class_resize_image,
         classification_sequence_lenght=5,
+        model_classification=class_model,
+        
+        # general infos
         description=description,
         condition=condition,
         input_images_folder=input_folder,
-        segmentation_slice_selection=seg_mode,
     )
 
 def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
@@ -454,20 +461,20 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
         {
             "class_model_path": "classification/classification_spinal_canal_stenosis.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st2.ts",
-            "seg_model_path": "trained_models/v2/model_segmentation_st2.ts",
+            "seg_model_path": "segmentation/model_segmentation_st2_384x384.ts",
             "description": "Sagittal T2/STIR",
             "condition": "Spinal Canal Stenosis",
-            "class_input_size": (96, 128),
+            "class_input_size": (64, 96),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
         {
             "class_model_path": "classification/classification_right_neural_foraminal_narrowing.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st1_right.ts",
-            "seg_model_path": "trained_models/v2/model_segmentation_st1_right.ts",
+            "seg_model_path": "segmentation/model_segmentation_st1_right_384x384.ts",
             "description": "Sagittal T1",
             "condition": "Right Neural Foraminal Narrowing",
-            "class_input_size": (96, 128),
+            "class_input_size": (64, 96),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
@@ -477,7 +484,7 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
             "seg_model_path": "trained_models/v2/model_segmentation_st1_left.ts",
             "description": "Sagittal T1",
             "condition": "Left Neural Foraminal Narrowing",
-            "class_input_size": (96, 128),
+            "class_input_size": (64, 96),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
@@ -487,7 +494,7 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
             "seg_model_path": "trained_models/v2/model_segmentation_axt2_right.ts",
             "description": "Axial T2",
             "condition": "Right Subarticular Stenosis",
-            "class_input_size": (128, 128),
+            "class_input_size": (96, 96),
             "class_resize_image": (720, 720),
             "segmentation_slice_selection": "best_by_level",
         },
@@ -497,7 +504,7 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
             "seg_model_path": "trained_models/v2/model_segmentation_axt2_left.ts",
             "description": "Axial T2",
             "condition": "Left Subarticular Stenosis",
-            "class_input_size": (128, 128),
+            "class_input_size": (96, 96),
             "class_resize_image": (720, 720),
             "segmentation_slice_selection": "best_by_level",
         },
@@ -505,7 +512,7 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
 
     studies_id = df_description["study_id"].unique()
     task_configs = []
-    for task in tasks:
+    for task in tasks[1:2]:
         print(f'Loading models and configuring for task: {task["condition"]}')
         model_classification = load_model_classification(task["class_model_path"])
         config = configure_inference(

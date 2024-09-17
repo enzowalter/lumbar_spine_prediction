@@ -508,6 +508,26 @@ class MobileNetDualOutput(nn.Module):
 ###############################################################################
 ###############################################################################
 
+class MetaModelClassifier(nn.Module):
+    def __init__(self, feature_size, seq_lenght, n_classes):
+        super().__init__()
+        self.feature_size = feature_size
+        self.seq_lenght = seq_lenght
+        self.n_classes = n_classes
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.feature_size * self.seq_lenght, self.feature_size),
+            nn.ReLU(),
+            nn.Linear(self.feature_size, self.feature_size // 2),
+            nn.ReLU(),
+            nn.Linear(self.feature_size // 2, self.n_classes),
+        )
+    
+    def forward(self, x):
+        x = x.view(x.size(0), self.feature_size * self.seq_lenght)
+        x = self.classifier(x)
+        return x
+
 class SimpleClassifier(nn.Module):
     def __init__(self, encoder_name):
         super().__init__()
