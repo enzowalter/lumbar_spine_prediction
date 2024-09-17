@@ -35,9 +35,9 @@ if __name__ == "__main__":
     LABELS = {"Normal/Mild" : 0, "Moderate": 1, "Severe": 2}
 
     column_names = [
-        #"spinal_canal_stenosis",
+        "spinal_canal_stenosis",
         #"left_neural_foraminal_narrowing",
-        "right_neural_foraminal_narrowing",
+        #"right_neural_foraminal_narrowing",
         #"left_subarticular_stenosis",
         #"right_subarticular_stenosis"
     ]

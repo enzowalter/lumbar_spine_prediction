@@ -66,13 +66,13 @@ def clahe_equalization_norm2(image, clip_limit=2.0, grid_size=(8, 8)):
     return image
 
 def cut_crops(slices_path, x, y, crop_size, image_resize):
-    output_crops = np.zeros((len(slices_path), 224, 224))
+    output_crops = np.zeros((len(slices_path), 128, 128))
     for k, slice_path in enumerate(slices_path):
         pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
         crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
         crop = clahe_equalization_norm2(crop)
-        crop = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR)
+        crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_LINEAR)
         output_crops[k, ...] = crop
     return output_crops
 
@@ -278,32 +278,41 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     model = FoldModelClassifier(
         n_classes=3,
         n_fold_classifier=3,
-        backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k', 'vit_small_patch16_224.augreg_in21k_ft_in1k'],
+        backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k'],
+        #backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k', 'vit_small_patch16_224.augreg_in21k_ft_in1k'],
         features_size=256,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-
     # train with folding
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=20, gamma=0.5)
-    criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
+    criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
     for epoch in range(20):
         loss_train = train_epoch(model, "fold", train_loader, criterion, optimizer, device)
         metrics = validate(model, "fold", valid_loader, criterion, device)
-        print("Epoch folding", epoch, "train_loss=", loss_train, "metrics=", metrics)
-        if metrics['logloss'] < best:
+        print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
+        if metrics['loss'] < best:
             print("New best model !", model_name)
-            best = metrics["logloss"]
+            best = metrics["loss"]
             torch.save(model.state_dict(), model_name)
-
         scheduler.step()
+        print('-' * 50)
     return best
 
 if __name__ == "__main__":
-    best_logloss = train_submodel(
+    best_logloss1 = train_submodel(
+                    input_dir="../../REFAIT",
+                    model_name="classification_spinal_canal_stenosis.pth",
+                    crop_condition="Spinal Canal Stenosis",
+                    label_condition="Spinal Canal Stenosis",
+                    crop_description="Sagittal T2/STIR",
+                    crop_size=(64, 96),
+                    image_resize=(640, 640),
+    )
+    best_logloss2 = train_submodel(
                     input_dir="../../REFAIT",
                     model_name="classification_left_neural_foraminal_narrowing.pth",
                     crop_condition="Left Neural Foraminal Narrowing",
@@ -312,5 +321,38 @@ if __name__ == "__main__":
                     crop_size=(64, 96),
                     image_resize=(640, 640),
     )
-    print("Best metric:", best_logloss)
-    print("-" * 50)
+    best_logloss3 = train_submodel(
+                    input_dir="../../REFAIT",
+                    model_name="classification_right_neural_foraminal_narrowing.pth",
+                    crop_condition="Right Neural Foraminal Narrowing",
+                    label_condition="Right Neural Foraminal Narrowing",
+                    crop_description="Sagittal T1",
+                    crop_size=(64, 96),
+                    image_resize=(640, 640),
+    )
+    best_logloss4 = train_submodel(
+                    input_dir="../../REFAIT",
+                    model_name="classification_right_subarticular_stenosis.pth",
+                    crop_condition="Right Subarticular Stenosis",
+                    label_condition="Right Subarticular Stenosis",
+                    crop_description="Axial T2",
+                    crop_size=(96, 96),
+                    image_resize=(720, 720),
+    )
+    best_logloss5 = train_submodel(
+                    input_dir="../../REFAIT",
+                    model_name="classification_left_subarticular_stenosis.pth",
+                    crop_condition="Left Subarticular Stenosis",
+                    label_condition="Left Subarticular Stenosis",
+                    crop_description="Axial T2",
+                    crop_size=(96, 96),
+                    image_resize=(720, 720),
+    )
+
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print(best_logloss1, best_logloss2, best_logloss3, best_logloss4, best_logloss5)

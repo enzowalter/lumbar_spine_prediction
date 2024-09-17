@@ -253,7 +253,14 @@ def train_submodel_test_encoder(input_dir, model_name, crop_description, crop_co
 
     # get model
     model = SimpleClassifier(encoder_name)
-
+    '''
+    model = FoldModelClassifier(
+        n_classes=3,
+        n_fold_classifier=5,
+        backbones=['ecaresnet26t.ra2_in1k', "seresnet50.a1_in1k", "resnet26t.ra2_in1k", "mobilenetv3_small_100.lamb_in1k", "efficientnet_b0.ra_in1k"],
+        features_size=256,
+    )
+    '''
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -262,7 +269,7 @@ def train_submodel_test_encoder(input_dir, model_name, crop_description, crop_co
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=5, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
     best = 123456
-    for epoch in range(8):
+    for epoch in range(4):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
@@ -275,14 +282,14 @@ def train_submodel_test_encoder(input_dir, model_name, crop_description, crop_co
 if __name__ == "__main__":
         
     encoders = [
-        #'densenet201.tv_in1k',
-        #'seresnext101_32x4d.gluon_in1k',
-        'resnest101e.in1k',
-        #'ecaresnet50d.miil_in1k',
-        #'mobilenetv3_large_100.ra_in1k',
-        'rexnet_300.nav_in1k',
-        'skresnet34.ra_in1k',
-        'rexnet_150.nav_in1k',
+        'densenet201.tv_in1k',
+        'seresnext101_32x4d.gluon_in1k',
+        #'resnest101e.in1k', NEED BIGGER IMAGE
+        'ecaresnet50d.miil_in1k',
+        'mobilenetv3_large_100.ra_in1k',
+        #'rexnet_300.nav_in1k', NEED BIGGER IMAGE
+        #'skresnet34.ra_in1k', NEED BIGGER IMAGE
+        #'rexnet_150.nav_in1k', NEED BIGGER IMAGE
     ]
     metrics = dict()
     for encoder in encoders:

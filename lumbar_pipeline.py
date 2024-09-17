@@ -16,10 +16,12 @@ from scipy.ndimage import label, center_of_mass
 import torch
 import torch.nn as nn
 import timm
+torch.set_grad_enabled(False) # remove grad for the script
 
 class DynamicModelLoader:
-    def __init__(self, model_name, num_classes=3, pretrained=True, hidden_size=256):
+    def __init__(self, model_name, num_classes=3, pretrained=False, hidden_size=256):
         self.model = timm.create_model(model_name, pretrained=pretrained)
+        self.model_name = model_name
         self.num_classes = num_classes
         self.hidden_size = hidden_size
         self.feature_size = self.get_feature_size()
@@ -27,30 +29,62 @@ class DynamicModelLoader:
 
     def get_feature_size(self):
         with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 224, 224)
+            dummy_input = torch.randn(1, 3, 128, 128)
             features = self.model.forward_features(dummy_input)
             return features.shape[1]
     
     def modify_classifier(self):
-        if hasattr(self.model, 'fc'):
-            in_features = self.model.fc.in_features
-            self.model.fc = nn.Sequential(
-                nn.Linear(in_features, self.hidden_size),
-            )
-        elif hasattr(self.model, 'classifier'):
-            in_features = self.model.classifier.in_features
-            self.model.classifier = nn.Sequential(
-                nn.Linear(in_features, self.hidden_size),
-            )
+        if 'vit_small_patch16_224' in self.model_name:
+                self.model.head = nn.Sequential(
+                    nn.Flatten(start_dim=1),
+                    nn.Linear(384, self.hidden_size),
+                )
         else:
-            raise NotImplementedError("Unknown classifier structure")
+            if hasattr(self.model, 'fc'):
+                in_features = self.model.fc.in_features
+                self.model.fc = nn.Sequential(
+                    nn.Linear(in_features, self.hidden_size),
+                )
+            elif hasattr(self.model, 'classifier'):
+                in_features = self.model.classifier.in_features
+                self.model.classifier = nn.Sequential(
+                    nn.Linear(in_features, self.hidden_size),
+                )
+            elif hasattr(self.model, 'head'):
+                in_features = self.model.head.fc.in_features if hasattr(self.model.head, 'fc') else self.model.head.in_features
+                self.model.head = nn.Sequential(
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten(start_dim=1),
+                    nn.Linear(in_features, self.hidden_size),
+                )
+            else:
+                raise NotImplementedError("Unknown classifier structure")
         return self.model
+
+class FoldEncoderAttention(nn.Module):
+    def __init__(self, features):
+        super().__init__()
+        self.query = nn.Linear(features, features)
+        self.key = nn.Linear(features, features)
+        self.value = nn.Linear(features, features)
+        self.softmax = nn.Softmax(dim=1)
+    
+    def forward(self, encoded):
+        query = self.query(encoded)
+        key = self.key(encoded)
+        value = self.value(encoded)
+
+        attention_scores = torch.einsum('bsf,bsf->bs', query, key) / (encoded.size(-1) ** 0.5)
+        attention_weights = self.softmax(attention_scores)
+        weighted_sum = torch.einsum('bsf,bs->bf', value, attention_weights)
+
+        return weighted_sum
 
 class FoldEncoder(nn.Module):
     def __init__(self, features_size, backbone_name):
         super().__init__()
         self.name = backbone_name
-        self.model = DynamicModelLoader(model_name=backbone_name, pretrained=False, hidden_size=features_size).model
+        self.model = DynamicModelLoader(model_name=backbone_name, hidden_size=features_size).model
 
     def forward(self, x):
         return self.model(x)
@@ -73,6 +107,7 @@ class FoldModelClassifier(nn.Module):
         self.n_fold_enc = len(backbones)
         self.n_fold_cla = n_fold_classifier
         self.features_size = features_size
+        self.n_classes = n_classes
         
         self.fold_backbones = nn.ModuleList([
             FoldEncoder(features_size, backbone) for backbone in backbones
@@ -82,29 +117,24 @@ class FoldModelClassifier(nn.Module):
             FoldClassifier(features_size, n_classes) for _ in range(n_fold_classifier)
         ])
 
-    def forward(self, crop, mode):
-        if mode == "train":
-            r_b = torch.randint(0, self.n_fold_enc, (1,)).item()
-            backbone = self.fold_backbones[r_b]
+        self.classifiers_weight = torch.ones((self.n_fold_cla, self.n_fold_enc), dtype=torch.float32)
+        self.final_classifier_weight = nn.Parameter(torch.tensor([1. for _ in range(self.n_fold_cla)], dtype=torch.float32))
 
-            r_c = torch.randint(0, self.n_fold_cla, (1,)).item()
-            classifier = self.fold_classifiers[r_c]
-    
-            encoded = backbone(crop)
-            output = classifier(encoded)
-            return output
+    def forward_encoders(self, crop):
+        encodeds = torch.stack([backbone(crop) for backbone in self.fold_backbones], dim=1)
+        return encodeds
 
-        if mode == "valid" or mode == "inference":
-            final_output = list()
-            _encodeds = torch.stack([backbone(crop) for backbone in self.fold_backbones], dim=1)
-            for classifier in self.fold_classifiers:
-                classified_ = torch.stack([classifier(_encodeds[:, i]) for i in range(self.n_fold_enc)], dim=1)
-                classifier_output = torch.mean(classified_, dim=1)
-                final_output.append(classifier_output)
+    def forward(self, crop):
+        final_output = list()
+        _encodeds = self.forward_encoders(crop)
+        for classifier in self.fold_classifiers:
+            classified_ = torch.stack([classifier(_encodeds[:, i]) for i in range(self.n_fold_enc)], dim=1)
+            classifier_output = torch.mean(classified_, dim=1)
+            final_output.append(classifier_output)
 
-            final_output = torch.stack(final_output, dim=1)
-            final_output = torch.mean(final_output, dim=1)
-            return final_output
+        final_output = torch.stack(final_output, dim=1)
+        final_output = torch.mean(final_output, dim=1)
+        return final_output
 
 ##########################################################
 #
@@ -116,16 +146,16 @@ def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
 
 def get_device():
+    #return torch.device("cpu")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_model_classification(model_path):
     model = FoldModelClassifier(
         n_classes=3,
         n_fold_classifier=3,
-        backbones=['ecaresnet26t.ra2_in1k', "seresnet50.a1_in1k", "resnet26t.ra2_in1k", "mobilenetv3_small_100.lamb_in1k", "efficientnet_b0.ra_in1k"],
+        backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k'],
         features_size=256,
     )
-
     model.load_state_dict(torch.load(model_path, weights_only=True, map_location="cpu"))
     return model.eval().to(get_device())
 
@@ -296,6 +326,13 @@ def get_position_by_level(slices_to_use: list, config: dict) -> dict:
 #
 ##########################################################
 
+def clahe_equalization_norm2(image, clip_limit=2.0, grid_size=(8, 8)):
+    image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    image = clahe.apply(np.uint8(image))
+    image = image.astype(np.float32) / 255.
+    return image
+
 def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY):
     square = np.zeros((sizeX, sizeY), dtype=array.dtype)
     start_x = max(center_x - (sizeX // 2), 0)
@@ -310,21 +347,29 @@ def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY
     return square
 
 def cut_crops(slices_path, x, y, crop_size, image_resize):
-    output_crops = np.zeros((len(slices_path), 224, 224))
+    output_crops = np.zeros((len(slices_path), 128, 128))
     for k, slice_path in enumerate(slices_path):
         pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
-        pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min() + 1e-9)
         crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
-        crop = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR)
+        crop = clahe_equalization_norm2(crop)
+        crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_LINEAR)
         output_crops[k, ...] = crop
     return output_crops
 
 def get_crops_by_level(slices_to_use, position_by_level, config):
-    crops_output = np.zeros((5, 3, 224, 224))
+    crops_output = np.zeros((5, 3, 128, 128))
     for level, (slices_, position) in enumerate(zip(slices_to_use["best_by_level"], position_by_level)):
         if position is not None:
             slices = sorted(slices_[:config['classification_sequence_lenght']], key = lambda x : get_instance(x))
+
+            # test position
+            # s_test = slices_[:config['classification_sequence_lenght']][0]
+            # shape_test = pydicom.dcmread(s_test).pixel_array.shape
+            # px = int(position[0] * shape_test[1])
+            # py = int(position[1] * shape_test[0])
+            # print("level", level, "x", px, 'y', py)
+
             px = int(position[0] * config['classification_resize_image'][0])
             py = int(position[1] * config['classification_resize_image'][0])
             crops_output[level, ...] = cut_crops(slices, px, py, config['classification_input_size'], config['classification_resize_image'])
@@ -335,7 +380,7 @@ def get_crops_by_level(slices_to_use, position_by_level, config):
     return crops_output
 
 def get_classification(crops: torch.tensor, config):
-    preds = config['model_classification'](crops, mode="inference")
+    preds = config['model_classification'](crops)
     preds = torch.softmax(preds, dim=1)
     return preds
 
@@ -356,18 +401,20 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict, study_id: int) ->
             best_overall=best_slices_overall
         )
         
+        #print(slices_to_use)
+
         positions_by_level = get_position_by_level(slices_to_use, config)
+
+        #print(positions_by_level)
+
         crops_by_level = get_crops_by_level(slices_to_use, positions_by_level, config)
-        for level in range(5):
-            for i in range(3):
-                c = crops_by_level[level, i].detach().cpu().numpy()
-                cv2.imwrite(f"{config['condition']}_crop_{level}_{i}.jpg", c * 255)
         classification_results = get_classification(crops_by_level, config)
+
+        #print(classification_results)
+
     except Exception as e:
         print(f"Error {study_id} {config['condition']}:", e)
         classification_results = None
-        import sys
-        sys.exit(1)
 
     predictions = list()
     row_id = f"{study_id}_{config['condition'].lower().replace(' ', '_')}"
@@ -405,53 +452,53 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
 
     tasks = [
         {
-            "class_model_path": "trained_models/v2/model_classification_st2.pth",
+            "class_model_path": "classification/classification_spinal_canal_stenosis.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st2.ts",
             "seg_model_path": "trained_models/v2/model_segmentation_st2.ts",
             "description": "Sagittal T2/STIR",
             "condition": "Spinal Canal Stenosis",
-            "class_input_size": (96, 164),
+            "class_input_size": (96, 128),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v2/model_classification_st1_right.pth",
+            "class_model_path": "classification/classification_right_neural_foraminal_narrowing.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st1_right.ts",
             "seg_model_path": "trained_models/v2/model_segmentation_st1_right.ts",
             "description": "Sagittal T1",
             "condition": "Right Neural Foraminal Narrowing",
-            "class_input_size": (96, 164),
+            "class_input_size": (96, 128),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v2/model_classification_st1_left.pth",
+            "class_model_path": "classification/classification_left_neural_foraminal_narrowing.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st1_left.ts",
             "seg_model_path": "trained_models/v2/model_segmentation_st1_left.ts",
             "description": "Sagittal T1",
             "condition": "Left Neural Foraminal Narrowing",
-            "class_input_size": (96, 164),
+            "class_input_size": (96, 128),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "trained_models/v2/model_classification_axt2_right.pth",
+            "class_model_path": "classification/classification_right_subarticular_stenosis.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_axt2_right.ts",
             "seg_model_path": "trained_models/v2/model_segmentation_axt2_right.ts",
             "description": "Axial T2",
             "condition": "Right Subarticular Stenosis",
-            "class_input_size": (164, 164),
-            "class_resize_image": (800, 800),
+            "class_input_size": (128, 128),
+            "class_resize_image": (720, 720),
             "segmentation_slice_selection": "best_by_level",
         },
         {
-            "class_model_path": "trained_models/v2/model_classification_axt2_left.pth",
+            "class_model_path": "classification/classification_left_subarticular_stenosis.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_axt2_left.ts",
             "seg_model_path": "trained_models/v2/model_segmentation_axt2_left.ts",
             "description": "Axial T2",
             "condition": "Left Subarticular Stenosis",
-            "class_input_size": (164, 164),
-            "class_resize_image": (800, 800),
+            "class_input_size": (128, 128),
+            "class_resize_image": (720, 720),
             "segmentation_slice_selection": "best_by_level",
         },
     ]
@@ -482,9 +529,9 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
         for config in task_configs:
             _predictions = predict_lumbar(df_description, config, study_id)
             final_predictions.extend(_predictions)
-
     return pd.DataFrame(final_predictions)
 
 if __name__ == "__main__":
-    df = compute_pipeline("../REFAIT/train_images/", "../REFAIT/train_series_descriptions.csv", 190)
+
+    df = compute_pipeline("../REFAIT/train_images/", "../REFAIT/train_series_descriptions.csv", 180)
     df.to_csv("spinal_preds.csv")

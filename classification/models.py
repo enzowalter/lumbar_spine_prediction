@@ -319,16 +319,15 @@ class FoldModelClassifier(nn.Module):
     def forward_fold(self, crop, mode):
         if mode == "train":
             r_b = torch.randint(0, self.n_fold_enc, (1,)).item()
-            #r_c = torch.randint(0, self.n_fold_cla, (1,)).item()
+            r_c = torch.randint(0, self.n_fold_cla, (1,)).item()
             backbone = self.fold_backbones[r_b]
-            classifier = self.fold_classifiers[r_b]
+            classifier = self.fold_classifiers[r_c]
     
             encoded = backbone(crop)
             output = classifier(encoded)
             return output
 
         if mode == "valid" or mode == "inference":
-            '''
             final_output = list()
             _encodeds = self.forward_encoders(crop)
             for classifier in self.fold_classifiers:
@@ -339,7 +338,6 @@ class FoldModelClassifier(nn.Module):
             final_output = torch.stack(final_output, dim=1)
             final_output = torch.mean(final_output, dim=1)
             return final_output
-            '''
             final_output = list()
             for i in range(self.n_fold_enc):
                 enc = self.fold_backbones[i](crop)
@@ -349,18 +347,6 @@ class FoldModelClassifier(nn.Module):
             final_output = torch.mean(final_output, dim=1)
             return final_output
 
-    def forward_inference(self, crop):
-        _encodeds = self.forward_encoders(crop)
-        classifiers_output = torch.zeros(crop.size(0), self.n_fold_cla, self.n_classes).to(crop.device)
-        for c_index, classifier in enumerate(self.fold_classifiers):
-            _classified = torch.stack([classifier(_encodeds[:, i]) for i in range(self.n_fold_enc)], dim=1)
-            _classifier_weight = torch.softmax(self.classifiers_weight[c_index], dim=0).to(crop.device)
-            _classified = torch.einsum("bsf, s -> bf", _classified, _classifier_weight)
-            classifiers_output[:, c_index] = _classified
-
-        final_weights = torch.softmax(self.final_classifier_weight, dim=0).to(crop.device)
-        outputs = torch.einsum("bsf, s -> bf", classifiers_output, final_weights)
-        return outputs
 
 
 ###############################################################################
