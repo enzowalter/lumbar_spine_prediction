@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as FT
 import random
 import os
+from scipy.ndimage import label, center_of_mass
 
 import glob
 import torch
@@ -23,8 +24,60 @@ from models import *
 ############################################################
 ############################################################
 
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
+
+def get_max_consecutive3(predictions):
+    index = 1
+    max_index = predictions.size(0) - 1
+    best_index = None
+    best_sum = -1
+    while index < max_index:
+        current_sum = predictions[index - 1] + predictions[index] + predictions[index + 1]
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_index = index
+        index += 1
+    
+    indices = [best_index-1, best_index, best_index+1]
+    values = [predictions[best_index-1], predictions[best_index], predictions[best_index+1]]
+    return values, indices
+
+def get_best_slice_selection(model_selection, pathes):
+    nb_slices = len(pathes)
+    images = np.zeros((nb_slices, 1, 224, 224))
+    for k, path in enumerate(pathes):
+        im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
+                                        (224, 224),
+                                        interpolation=cv2.INTER_LINEAR)
+        im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+        images[k, 0, ...] = im
+    images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
+    with torch.no_grad():
+        preds = model_selection(images.to(get_device()).unsqueeze(0)).squeeze()
+    preds_overall = torch.sum(preds, dim=0)
+
+    # get best by level
+    slices_by_level = [
+        {"pathes": list(), "values": list()} for _ in range(preds.shape[0])
+    ]
+    for level in range(preds.shape[0]):
+        pred_level = preds[level, :]
+        values, max_indice = get_max_consecutive3(pred_level)
+        slices_by_level[level]['pathes'] = [pathes[i] for i in max_indice]
+        slices_by_level[level]['values'] = [v for v in values]
+
+    # get best overall (=> best after sum of each level)
+    values, max_indices = get_max_consecutive3(preds_overall)
+    best_slices_overall = dict()
+    best_slices_overall['pathes'] = [pathes[i] for i in max_indices]
+    best_slices_overall['values'] = [v for v in values]
+
+    return slices_by_level, best_slices_overall
+
 
 def get_study_labels(study_id, df_study_labels, condition, levels, labels):
     label_name = condition.lower().replace(" ", "_")
@@ -76,15 +129,50 @@ def cut_crops(slices_path, x, y, crop_size, image_resize):
         output_crops[k, ...] = crop
     return output_crops
 
+def find_center_of_largest_activation(mask: torch.tensor) -> tuple:
+    mask = (mask > 0.5).float().detach().cpu().numpy()
+    labeled_mask, num_features = label(mask)
+    if num_features == 0:
+        return None
+    sizes = np.bincount(labeled_mask.ravel())
+    sizes[0] = 0
+    largest_component_center = center_of_mass(labeled_mask == np.argmax(sizes))
+    center_coords = tuple(map(int, largest_component_center))
+    return (center_coords[1] / mask.shape[1], center_coords[0] / mask.shape[0]) # x, y normalised
+
+def get_segmentation_input(slices_to_use: list):
+    images = np.zeros((3, 384, 384))
+    _slices_path = slices_to_use[:3]
+    for k, path in enumerate(_slices_path):
+        im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
+                        (384, 384),
+                        interpolation=cv2.INTER_LINEAR
+                    )
+        im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+        images[k, ...] = im
+    images = torch.tensor(images).float().to(get_device())
+    return images
+
+def get_position_by_level(slices_to_use: list, model_segmentation) -> dict:
+    inputs = get_segmentation_input(slices_to_use['pathes'])
+    with torch.no_grad():
+        masks = model_segmentation(inputs.unsqueeze(0)) # model predict 5 levels
+    masks = masks.squeeze()
+    position_by_level = [find_center_of_largest_activation(masks[i]) for i in range(5)]
+    return position_by_level
+
 ############################################################
 ############################################################
 #          GEN DATASET
 ############################################################
 ############################################################
 
-def generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize):
+def generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize, selection_path, segmentation_path):
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
     LABELS = {"Normal/Mild" : 0, "Moderate": 1, "Severe": 2}
+
+    model_selection = torch.jit.load(selection_path).eval().to(get_device())
+    model_segmentation = torch.jit.load(segmentation_path).eval().to(get_device())
 
     df_study_labels = pd.read_csv(f"{input_dir}/train.csv")
     df_study_coordinates = pd.read_csv(f"{input_dir}/train_label_coordinates.csv")
@@ -108,47 +196,25 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
                 gt_labels = get_study_labels(study_id, df_study_labels, label_condition, LEVELS, LABELS)
 
                 if gt_labels is not None:
-                    for coordinate in coordinates_dict:
-                        try:
-                            dataset_item = dict()
+                    best_per_level, best_overall = get_best_slice_selection(model_selection, all_slices_path)
+                    position_by_level = get_position_by_level(best_overall, model_segmentation) 
 
-                            # get original slices
-                            dataset_item['slices_path'] = list()
-                            for idx, sp in enumerate(all_slices_path):
-                                if get_instance(sp) == coordinate['instance_number']:
-                                    if idx == 0:
-                                        dataset_item['slices_path'].append(all_slices_path[idx])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx + 1])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx + 2])
-                                    elif idx == len(all_slices_path) - 1:
-                                        dataset_item['slices_path'].append(all_slices_path[idx - 2])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx - 1])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx])
-                                    else:
-                                        dataset_item['slices_path'].append(all_slices_path[idx - 1])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx + 1])
-
-                                    break
-
-                            idx_level = LEVELS[coordinate['level']]
-                            x, y = coordinate['x'], coordinate['y']
-                            original_shape = pydicom.dcmread(f"{input_dir}/train_images/{study_id}/{s_id}/{coordinate['instance_number']}.dcm").pixel_array.shape
-                            x = int((x / original_shape[1]) * image_resize[1]) 
-                            y = int((y / original_shape[0]) * image_resize[0])
-
-                            dataset_item['study_id'] = study_id
-                            dataset_item['series_id'] = s_id
-                            dataset_item['position'] = (x, y)
-                            dataset_item['gt_label'] = gt_labels[idx_level]
-                            dataset_item['crop_size'] = crop_size
-                            dataset_item['image_resize'] = image_resize
-
-                            dataset.append(dataset_item)
-
-                        except Exception as e:
-                            print("Error add item", e)
+                    for level in range(5):
+                        if position_by_level[level] is None:
                             continue
+                        dataset_item = dict()
+                        dataset_item['study_id'] = study_id
+                        dataset_item['level'] = level
+                        dataset_item['slices_to_use'] = best_per_level[level]['pathes']
+                        dataset_item['series_id'] = s_id
+                        x, y = position_by_level[level]
+                        dataset_item['position'] = (int(x * 640), int(y * 640))
+                        dataset_item['gt_label'] = gt_labels[level]
+                        dataset_item['crop_size'] = crop_size
+                        dataset_item['image_resize'] = image_resize
+
+                        dataset.append(dataset_item)
+
     return dataset
 
 
@@ -157,13 +223,6 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
 #          DATALOADER
 ############################################################
 ############################################################
-
-def tensor_augmentations(tensor_image):
-    angle = random.uniform(-20, 20)
-    tensor_image = FT.rotate(tensor_image, angle)
-    noise = torch.randn(tensor_image.size()) * 0.021
-    tensor_image = tensor_image + noise
-    return tensor_image
 
 class CropClassifierDataset(Dataset):
     def __init__(self, infos, is_train=False):
@@ -175,17 +234,10 @@ class CropClassifierDataset(Dataset):
 
     def __getitem__(self, idx):
         data = self.datas[idx]
-        slices_to_use = data['slices_path']
+        slices_to_use = data['slices_to_use']
         x, y = data['position']
-
-        if self.is_train:
-            x += random.randint(-10, 11)
-            y += random.randint(-10, 11)
-
         crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'])
         crops = torch.tensor(crops).float()
-        if self.is_train:
-            crops = tensor_augmentations(crops)
         return crops, data['gt_label']
 
 ############################################################
@@ -233,9 +285,8 @@ def train_epoch(model, loader, criterion, optimizer, device):
         optimizer.zero_grad()
         images = images.to(device)
         labels = labels.to(device).long()
-
+        
         predictions = model.forward_fold(images.to(device), mode="train")
-
         loss = criterion(predictions, labels)
         loss.backward()
         optimizer.step()
@@ -243,10 +294,10 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
     return epoch_loss
 
-def train_submodel(input_dir, model_name, crop_description, crop_condition, label_condition, crop_size, image_resize):
 
+def train_submodel(input_dir, model_name, crop_description, crop_condition, label_condition, crop_size, image_resize, select_path, seg_path):
     # get dataset
-    dataset = generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize)
+    dataset = generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize, select_path, seg_path)
     nb_valid = int(len(dataset) * 0.1)
     train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True)
     valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False)
@@ -260,7 +311,7 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
         backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k'],
         features_size=384,
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     model = model.to(device)
 
     # train with folding
@@ -281,35 +332,45 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     return best
 
 if __name__ == "__main__":
-    best_logloss1 = train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_spinal_canal_stenosis.pth",
-                    crop_condition="Spinal Canal Stenosis",
-                    label_condition="Spinal Canal Stenosis",
-                    crop_description="Sagittal T2/STIR",
-                    crop_size=(80, 120),
-                    image_resize=(640, 640),
-    )
 
-    """
+    # best_logloss1 = train_submodel(
+    #                 input_dir="../../REFAIT",
+    #                 model_name="classification_spinal_canal_stenosis_pipeline_dataset.pth",
+    #                 crop_condition="Spinal Canal Stenosis",
+    #                 label_condition="Spinal Canal Stenosis",
+    #                 crop_description="Sagittal T2/STIR",
+    #                 crop_size=(80, 120),
+    #                 image_resize=(640, 640),
+    #                 select_path="../trained_models/v3/model_slice_selection_st2.ts",
+    #                 seg_path="../trained_models/v3/model_segmentation_st2_384x384.ts",
+    # )
     best_logloss2 = train_submodel(
                     input_dir="../../REFAIT",
-                    model_name="classification_left_neural_foraminal_narrowing.pth",
+                    model_name="classification_left_neural_foraminal_narrowing_pipeline_dataset.pth",
                     crop_condition="Left Neural Foraminal Narrowing",
                     label_condition="Left Neural Foraminal Narrowing",
                     crop_description="Sagittal T1",
-                    crop_size=(64, 96),
+                    crop_size=(80, 120),
                     image_resize=(640, 640),
+                    select_path="../trained_models/v3/model_slice_selection_st1_left.ts",
+                    seg_path="../trained_models/v3/model_segmentation_st1_left_384x384.ts",
     )
+    '''
     best_logloss3 = train_submodel(
                     input_dir="../../REFAIT",
-                    model_name="classification_right_neural_foraminal_narrowing.pth",
+                    model_name="classification_right_neural_foraminal_narrowing_pipeline_dataset.pth",
                     crop_condition="Right Neural Foraminal Narrowing",
                     label_condition="Right Neural Foraminal Narrowing",
                     crop_description="Sagittal T1",
-                    crop_size=(64, 96),
+                    crop_size=(80, 120),
                     image_resize=(640, 640),
+                    select_path="../trained_models/v3/model_slice_selection_st1_right.ts",
+                    seg_path="../trained_models/v3/model_segmentation_st1_right_384x384.ts",
     )
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
+    print(best_logloss1, best_logloss2, best_logloss3)
+
     best_logloss4 = train_submodel(
                     input_dir="../../REFAIT",
                     model_name="classification_right_subarticular_stenosis.pth",
@@ -335,4 +396,4 @@ if __name__ == "__main__":
     print("F>DDFQSSQDF>FDJK>DKJF>DJK")
     print("F>DDFQSSQDF>FDJK>DKJF>DJK")
     print(best_logloss1, best_logloss2, best_logloss3, best_logloss4, best_logloss5)
-    """
+    '''

@@ -44,7 +44,8 @@ def get_best_slice_selection(slice_model, pathes, device):
         im = (im - im.min()) / (im.max() - im.min() + 1e-9)
         images[k, 0, ...] = im
     images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
-    preds = slice_model(images.to(device).unsqueeze(0)).squeeze()
+    with torch.no_grad():
+        preds = slice_model(images.to(device).unsqueeze(0)).squeeze()
     preds = torch.sum(preds, dim=0)
     _, max_indices = get_max_consecutive3(preds)
     return [pathes[i] for i in max_indices]

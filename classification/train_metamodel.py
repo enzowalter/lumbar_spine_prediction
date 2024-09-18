@@ -177,6 +177,10 @@ class CropClassifierDataset(Dataset):
         data = self.datas[idx]
         slices_to_use = data['slices_path']
         x, y = data['position']
+
+        x += random.randint(-8, 8)
+        y += random.randint(-8, 8)
+
         crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'])
         crops = torch.tensor(crops).float()
         if self.is_train:
@@ -277,9 +281,8 @@ def train_metamodel(input_dir, model_name, crop_description, crop_condition, lab
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feature_model = FoldModelClassifier(
         n_classes=3,
-        n_fold_classifier=3,
+        n_fold_classifier=5,
         backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k'],
-        #backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k', 'vit_small_patch16_224.augreg_in21k_ft_in1k'],
         features_size=256,
     )
     feature_model.load_state_dict(torch.load(pretrained_path))
@@ -288,7 +291,7 @@ def train_metamodel(input_dir, model_name, crop_description, crop_condition, lab
     metamodel = metamodel.to(device)
 
     # train with folding
-    optimizer = torch.optim.AdamW(metamodel.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(metamodel.parameters(), lr=0.0005)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=20, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
@@ -311,7 +314,7 @@ if __name__ == "__main__":
                     crop_condition="Spinal Canal Stenosis",
                     label_condition="Spinal Canal Stenosis",
                     crop_description="Sagittal T2/STIR",
-                    crop_size=(64, 96),
+                    crop_size=(96, 144),
                     image_resize=(640, 640),
                     pretrained_path="classification_spinal_canal_stenosis.pth"
     )

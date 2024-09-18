@@ -46,6 +46,9 @@ def generate_dataset(input_dir, conditions, description):
                 dataset_item['study_id'] = study_id
                 dataset_item['series_id'] = s_id
                 dataset_item['slices_path'] = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
+                if len(dataset_item['slices_path']) > 60:
+                    print("Skipping to much frames", len(dataset_item['slices_path']))
+                    continue
                 dataset_item['nb_slices'] = len(dataset_item['slices_path'])
                 dataset_item['labels'] = np.zeros((len(LEVELS), len(dataset_item['slices_path'])))
                 dataset_item['gt_indices'] = np.zeros(len(LEVELS))
@@ -184,3 +187,7 @@ def train_model(input_dir, conditions, description, model_name):
     print("-" * 55)
     print("-" * 55)
     return best_metrics
+
+
+if __name__ == "__main__":
+    train_model("../../REFAIT", ["Left Subarticular Stenosis"], "Axial T2", "model_slice_selection_axt2_left.ts")

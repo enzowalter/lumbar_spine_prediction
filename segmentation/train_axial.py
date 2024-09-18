@@ -26,7 +26,8 @@ def get_best_slice_selection(slice_model, pathes, device):
         im = (im - im.min()) / (im.max() - im.min() + 1e-9)
         images[k, 0, ...] = im
     images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
-    preds = slice_model(images.to(device).unsqueeze(0)).squeeze()
+    with torch.no_grad():
+        preds = slice_model(images.to(device).unsqueeze(0)).squeeze()
     slices_to_ret = dict()
     for level in range(preds.shape[0]):
         pred_level = preds[level, :]
@@ -70,6 +71,10 @@ def generate_dataset(input_dir, conditions, description, slice_model):
             if len(coordinates_dict) == len(LEVELS):
                 dataset_item = dict()
                 all_slices = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
+                if len(all_slices) > 55:
+                    print("Too much slices, skipping")
+                    continue
+
                 slices_by_level = get_best_slice_selection(slice_model, all_slices, device)
 
                 for coordinate in coordinates_dict:
