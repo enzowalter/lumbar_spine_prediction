@@ -451,7 +451,7 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
 
     tasks = [
         {
-            "class_model_path": "classification/classification_spinal_canal_stenosis.pth",
+            "class_model_path": "classification/classification_spinal_canal_stenosis_pipeline_dataset.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st2.ts",
             "seg_model_path": "segmentation/model_segmentation_st2_384x384.ts",
             "description": "Sagittal T2/STIR",
@@ -461,22 +461,22 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "classification/classification_right_neural_foraminal_narrowing.pth",
+            "class_model_path": "classification/classification_right_neural_foraminal_narrowing_pipeline_dataset.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st1_right.ts",
             "seg_model_path": "segmentation/model_segmentation_st1_right_384x384.ts",
             "description": "Sagittal T1",
             "condition": "Right Neural Foraminal Narrowing",
-            "class_input_size": (96, 144),
+            "class_input_size": (80, 120),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
         {
-            "class_model_path": "classification/classification_left_neural_foraminal_narrowing.pth",
+            "class_model_path": "classification/classification_left_neural_foraminal_narrowing_pipeline_dataset.pth",
             "slice_model_path": "trained_models/v2/model_slice_selection_st1_left.ts",
             "seg_model_path": "segmentation/model_segmentation_st1_left_384x384.ts",
             "description": "Sagittal T1",
             "condition": "Left Neural Foraminal Narrowing",
-            "class_input_size": (64, 96),
+            "class_input_size": (80, 120),
             "class_resize_image": (640, 640),
             "segmentation_slice_selection": "best_overall",
         },
@@ -504,7 +504,7 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
 
     studies_id = df_description["study_id"].unique()
     task_configs = []
-    for task in tasks[:1]:
+    for task in tasks[1:2]:
         print(f'Loading models and configuring for task: {task["condition"]}')
         model_classification = load_model_classification(task["class_model_path"])
         config = configure_inference(

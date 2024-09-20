@@ -141,23 +141,26 @@ def find_center_of_largest_activation(mask: torch.tensor) -> tuple:
     return (center_coords[1] / mask.shape[1], center_coords[0] / mask.shape[0]) # x, y normalised
 
 def get_segmentation_input(slices_to_use: list):
-    images = np.zeros((3, 384, 384))
-    _slices_path = slices_to_use[:3]
-    for k, path in enumerate(_slices_path):
-        im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
-                        (384, 384),
-                        interpolation=cv2.INTER_LINEAR
-                    )
-        im = (im - im.min()) / (im.max() - im.min() + 1e-9)
-        images[k, ...] = im
+    images = np.zeros((5, 3, 384, 384))
+    for level in range(5):
+        _slices_to_use = slices_to_use[level]['pathes'][:3] # 3 slice per level => the best ones
+        _slices_to_use = sorted(_slices_to_use, key = lambda x: get_instance(x))
+        for ch, slice_to_use in enumerate(_slices_to_use):
+            im = cv2.resize(pydicom.dcmread(slice_to_use).pixel_array.astype(np.float32), 
+                            (384, 384),
+                            interpolation=cv2.INTER_LINEAR
+                        )
+            im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+            images[level, ch, ...] = im
     images = torch.tensor(images).float().to(get_device())
     return images
 
 def get_position_by_level(slices_to_use: list, model_segmentation) -> dict:
-    inputs = get_segmentation_input(slices_to_use['pathes'])
+    inputs = get_segmentation_input(slices_to_use)
     with torch.no_grad():
-        masks = model_segmentation(inputs.unsqueeze(0)) # model predict 5 levels
-    masks = masks.squeeze()
+        masks = model_segmentation(inputs)
+        masks = masks.squeeze(1)
+
     position_by_level = [find_center_of_largest_activation(masks[i]) for i in range(5)]
     return position_by_level
 
@@ -197,7 +200,7 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
 
                 if gt_labels is not None:
                     best_per_level, best_overall = get_best_slice_selection(model_selection, all_slices_path)
-                    position_by_level = get_position_by_level(best_overall, model_segmentation) 
+                    position_by_level = get_position_by_level(best_per_level, model_segmentation) 
 
                     for level in range(5):
                         if position_by_level[level] is None:
@@ -214,7 +217,6 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
                         dataset_item['image_resize'] = image_resize
 
                         dataset.append(dataset_item)
-
     return dataset
 
 
@@ -245,14 +247,6 @@ class CropClassifierDataset(Dataset):
 #          TRAINING
 ############################################################
 ############################################################
-
-def calculate_log_loss(predictions, labels, weights, epsilon=1e-9):
-    probabilities = torch.clamp(F.softmax(predictions, dim=1), min=epsilon, max=1 - epsilon)
-    one_hot_labels = F.one_hot(labels, num_classes=3).float()
-    log_loss_batch = -torch.sum(one_hot_labels * torch.log(probabilities), dim=1)
-    weights_per_sample = weights[labels.cpu().numpy()]
-    weighted_log_loss_batch = log_loss_batch * torch.tensor(weights_per_sample, device=labels.device)
-    return weighted_log_loss_batch
 
 def validate(model, loader, criterion, device):
     model.eval()
@@ -294,23 +288,21 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
     return epoch_loss
 
-
 def train_submodel(input_dir, model_name, crop_description, crop_condition, label_condition, crop_size, image_resize, select_path, seg_path):
     # get dataset
     dataset = generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize, select_path, seg_path)
     nb_valid = int(len(dataset) * 0.1)
     train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True)
     valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
     # get model
-    model = FoldModelClassifier(
+    model = REM(
         n_classes=3,
-        n_fold_classifier=5,
-        #backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k'],
-        backbones=['convnext_base.fb_in22k_ft_in1k', 'convnext_base.fb_in22k_ft_in1k', 'convnext_base.fb_in22k_ft_in1k', 'convnext_base.fb_in22k_ft_in1k', 'convnext_base.fb_in22k_ft_in1k'],
-        features_size=384,
+        n_fold_classifier=3,
+        backbones=['ese_vovnet39b.ra_in1k', 'cspresnet50.ra_in1k', 'mobilenetv3_small_100.lamb_in1k', 'ecaresnet26t.ra2_in1k', 'resnet26t.ra2_in1k'],
+        features_size=256,
     )
     device = get_device()
     model = model.to(device)
@@ -320,7 +312,7 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=20, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
-    for epoch in range(15):
+    for epoch in range(20):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
@@ -333,61 +325,25 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     return best
 
 if __name__ == "__main__":
-
-    best_logloss1 = train_submodel(
+    best_logloss4 = train_submodel(
                     input_dir="../../REFAIT",
-                    model_name="classification_spinal_canal_stenosis_pipeline_dataset.pth",
-                    crop_condition="Spinal Canal Stenosis",
-                    label_condition="Spinal Canal Stenosis",
-                    crop_description="Sagittal T2/STIR",
-                    crop_size=(64, 96),
+                    model_name="classification_right_subarticular_stenosis_pipeline_dataset.pth",
+                    crop_condition="Right Subarticular Stenosis",
+                    label_condition="Right Subarticular Stenosis",
+                    crop_description="Axial T2",
+                    crop_size=(164, 164),
                     image_resize=(640, 640),
-                    select_path="../trained_models/v3/model_slice_selection_st2.ts",
-                    seg_path="../trained_models/v3/model_segmentation_st2_384x384.ts",
+                    select_path="../trained_models/v3/model_slice_selection_axt2_right.ts",
+                    seg_path="../trained_models/v3/model_segmentation_axt2_right_384x384.ts",
     )
-    best_logloss2 = train_submodel(
+    best_logloss5 = train_submodel(
                     input_dir="../../REFAIT",
-                    model_name="classification_left_neural_foraminal_narrowing_pipeline_dataset.pth",
-                    crop_condition="Left Neural Foraminal Narrowing",
-                    label_condition="Left Neural Foraminal Narrowing",
-                    crop_description="Sagittal T1",
-                    crop_size=(64, 96),
+                    model_name="classification_left_subarticular_stenosis_pipeline_dataset.pth",
+                    crop_condition="Left Subarticular Stenosis",
+                    label_condition="Left Subarticular Stenosis",
+                    crop_description="Axial T2",
+                    crop_size=(164, 164),
                     image_resize=(640, 640),
-                    select_path="../trained_models/v3/model_slice_selection_st1_left.ts",
-                    seg_path="../trained_models/v3/model_segmentation_st1_left_384x384.ts",
+                    select_path="../trained_models/v3/model_slice_selection_axt2_left.ts",
+                    seg_path="../trained_models/v3/model_segmentation_axt2_left_384x384.ts",
     )
-    best_logloss3 = train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_right_neural_foraminal_narrowing_pipeline_dataset.pth",
-                    crop_condition="Right Neural Foraminal Narrowing",
-                    label_condition="Right Neural Foraminal Narrowing",
-                    crop_description="Sagittal T1",
-                    crop_size=(64, 96),
-                    image_resize=(640, 640),
-                    select_path="../trained_models/v3/model_slice_selection_st1_right.ts",
-                    seg_path="../trained_models/v3/model_segmentation_st1_right_384x384.ts",
-    )
-
-    # CHANGE LOADER SEGMENTATION !
-    # best_logloss4 = train_submodel(
-    #                 input_dir="../../REFAIT",
-    #                 model_name="classification_right_subarticular_stenosis_pipeline_dataset.pth",
-    #                 crop_condition="Right Subarticular Stenosis",
-    #                 label_condition="Right Subarticular Stenosis",
-    #                 crop_description="Axial T2",
-    #                 crop_size=(96, 96),
-    #                 image_resize=(640, 640),
-    #                 select_path="../trained_models/v3/model_slice_selection_axt2_right.ts",
-    #                 seg_path="../trained_models/v3/model_segmentation_axt2_right_384x384.ts",
-    # )
-    # best_logloss5 = train_submodel(
-    #                 input_dir="../../REFAIT",
-    #                 model_name="classification_left_subarticular_stenosis_pipeline_dataset.pth",
-    #                 crop_condition="Left Subarticular Stenosis",
-    #                 label_condition="Left Subarticular Stenosis",
-    #                 crop_description="Axial T2",
-    #                 crop_size=(96, 96),
-    #                 image_resize=(640, 640),
-    #                 select_path="../trained_models/v3/model_slice_selection_axt2_left.ts",
-    #                 seg_path="../trained_models/v3/model_segmentation_axt2_left_384x384.ts",
-    # )

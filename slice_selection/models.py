@@ -2,14 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+import timm
 
 class SagittalImageEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.backbone = torchvision.models.squeezenet1_0(weights="DEFAULT")
+        self.backbone = timm.create_model(model_name="tf_efficientnet_lite0.in1k", pretrained=True)
 
     def forward(self, x):
-        x = self.backbone.features(x)
+        x = self.backbone.forward_features(x)
         x = torch.mean(x, dim = (2, 3))
         return x
 
@@ -17,8 +18,12 @@ class SagittalSliceSelecterModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.image_encoder = SagittalImageEncoder()
-        self.lstm = nn.LSTM(512, 256, 2, batch_first=True, bidirectional=True)
-        self.classifier = nn.Linear(512, 5)
+        self.lstm = nn.LSTM(1280, 256, 2, batch_first=True, bidirectional=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 5),
+        )
 
     def forward(self, images):
         _, s, _, _, _ = images.size()

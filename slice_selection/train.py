@@ -80,14 +80,14 @@ class SlicePredicterDataset(Dataset):
         labels = data['labels']
         slices_path = data['slices_path']
         nb_slices = data['nb_slices']
-        images = np.zeros((nb_slices, 1, 224, 224))
+        images = np.zeros((nb_slices, 1, 128, 128))
         for k, path in enumerate(slices_path):
             im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
-                                           (224, 224),
+                                           (128, 128),
                                            interpolation=cv2.INTER_LINEAR)
             im = (im - im.min()) / (im.max() - im.min() + 1e-9)
             images[k, 0, ...] = im
-        images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
+        images = torch.tensor(images).expand(nb_slices, 3, 128, 128).float()
         return images, torch.tensor(labels).float(), np.array(data['gt_indices'])  
 
 def validate(model, loader, criterion, device):
@@ -160,7 +160,7 @@ def train_model(input_dir, conditions, description, model_name):
     model = SagittalSliceSelecterModel()
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     criterion = torch.nn.BCELoss()
 
     best_metrics = None

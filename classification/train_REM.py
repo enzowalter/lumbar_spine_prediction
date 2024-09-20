@@ -230,9 +230,9 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
 ############################################################
 
 def tensor_augmentations(tensor_image):
-    angle = random.uniform(-10, 10)
+    angle = random.uniform(-20, 20)
     tensor_image = FT.rotate(tensor_image, angle)
-    noise = torch.randn(tensor_image.size()) * 0.01
+    noise = torch.randn(tensor_image.size()) * 0.021
     tensor_image = tensor_image + noise
     return tensor_image
 
@@ -251,8 +251,8 @@ class CropClassifierDataset(Dataset):
         x, y = data['position']
 
         if self.is_train:
-            x += random.randint(-5, 6)
-            y += random.randint(-5, 6)
+            x += random.randint(-10, 11)
+            y += random.randint(-10, 11)
 
         crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'], self.normalisation)
         crops = torch.tensor(crops).float()
@@ -266,6 +266,14 @@ class CropClassifierDataset(Dataset):
 ############################################################
 ############################################################
 
+def calculate_log_loss(predictions, labels, weights, epsilon=1e-9):
+    probabilities = torch.clamp(F.softmax(predictions, dim=1), min=epsilon, max=1 - epsilon)
+    one_hot_labels = F.one_hot(labels, num_classes=3).float()
+    log_loss_batch = -torch.sum(one_hot_labels * torch.log(probabilities), dim=1)
+    weights_per_sample = weights[labels.cpu().numpy()]
+    weighted_log_loss_batch = log_loss_batch * torch.tensor(weights_per_sample, device=labels.device)
+    return weighted_log_loss_batch
+
 def validate(model, loader, criterion, device):
     model.eval()
     classification_loss_sum = 0
@@ -275,7 +283,7 @@ def validate(model, loader, criterion, device):
     with torch.no_grad():
         for images, labels_gt in tqdm.tqdm(loader, desc="Valid"):
             labels_gt = labels_gt.to(device).long()
-            final_output = model.forward_fold(images.to(device), mode="valid")
+            final_output = model(images.to(device))
             
             all_predictions.append(final_output.cpu())
             all_labels.append(labels_gt.cpu())
@@ -290,19 +298,34 @@ def validate(model, loader, criterion, device):
     avg_classification_loss = classification_loss_sum / len(loader)
     return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, backbone_optimizers, att_class_optimizer, device):
     model.train()
     epoch_loss = 0
-    for images, labels in tqdm.tqdm(loader, desc="Training", total=len(loader)):
-        optimizer.zero_grad()
+    backbone_iter = 0
+    accumulation_steps = 4
+    model.zero_grad()
+
+    for i, (images, labels) in enumerate(tqdm.tqdm(loader, desc="Training", total=len(loader))):
         images = images.to(device)
         labels = labels.to(device).long()
-        
-        predictions = model.forward_fold(images.to(device), mode="train")
+        predictions = model(images)
+
         loss = criterion(predictions, labels)
+        loss = loss / accumulation_steps
         loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item() / len(loader)
+
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(loader):
+            backbone_optimizers[backbone_iter].step()
+            backbone_iter = (backbone_iter + 1) % model.nb_backbones
+            
+            if backbone_iter == 0:
+                att_class_optimizer.step()
+                att_class_optimizer.zero_grad()
+            
+            for opt in backbone_optimizers:
+                opt.zero_grad()
+
+        epoch_loss += loss.item() * accumulation_steps
 
     return epoch_loss
 
@@ -324,53 +347,52 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     #     features_size=384,
     # )
 
+    backbones = ['ese_vovnet39b.ra_in1k', 'cspresnet50.ra_in1k', 'mobilenetv3_small_100.lamb_in1k']
+
     model = REM(
         n_classes=3,
-        n_fold_classifier=3,
-        backbones=['ese_vovnet39b.ra_in1k', 'cspresnet50.ra_in1k', 'mobilenetv3_small_100.lamb_in1k', 'ecaresnet26t.ra2_in1k', 'resnet26t.ra2_in1k'],
+        backbones=backbones,
         features_size=256,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
+    encoder_optimizers = list()
+    for i in range(len(backbones)):
+        optim = torch.optim.AdamW(model.backbones[i].parameters(), lr=5e-5)
+        encoder_optimizers.append(optim)
+
+    att_class_optimizer = torch.optim.AdamW(list(model.attention.parameters()) + list(model.classifier.parameters()), lr=4e-4)
+
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
-    for epoch in range(20):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
+    for epoch in range(10):
+        loss_train = train_epoch(model, train_loader, criterion, encoder_optimizers, att_class_optimizer, device)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
             print("New best model !", model_name)
             best = metrics["concat_loss"]
-            torch.save(model.state_dict(), model_name)
+            #torch.save(model.state_dict(), model_name)
         print('-' * 50)
     return best
 
 if __name__ == "__main__":
-
-    train_submodel(
+    best_logloss = train_submodel(
                     input_dir="../../REFAIT",
                     model_name="classification_right_subarticular_stenosis_pipeline_dataset.pth",
                     crop_condition="Right Subarticular Stenosis",
                     label_condition="Right Subarticular Stenosis",
                     crop_description="Axial T2",
-                    crop_size=(164, 164),
+                    crop_size=(184, 184),
                     image_resize=(640, 640),
                     normalisation="clahe_norm_2"
     )
-    train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_left_subarticular_stenosis_pipeline_dataset.pth",
-                    crop_condition="Left Subarticular Stenosis",
-                    label_condition="Left Subarticular Stenosis",
-                    crop_description="Axial T2",
-                    crop_size=(164, 164),
-                    image_resize=(640, 640),
-                    normalisation="clahe_norm_2"
-    )
+    print("Best metric:", best_logloss)
+    print("-" * 50)
 
     """
+
     best_logloss1 = train_submodel(
                     input_dir="../../REFAIT",
                     model_name="classification_spinal_canal_stenosis.pth",
