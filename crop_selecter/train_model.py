@@ -26,25 +26,6 @@ from models import *
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
 
-def get_study_labels(study_id, df_study_labels, condition, levels, labels):
-    label_name = condition.lower().replace(" ", "_")
-    all_labels = df_study_labels[df_study_labels['study_id'] == study_id]
-    columns_of_interest = [col for col in all_labels.columns if label_name in col]
-    filtered_labels = all_labels[columns_of_interest].to_dict('records')[0]
-    final_labels = np.zeros(len(levels))
-
-    for level in levels:
-        level_name = level.lower().replace('/', '_')
-        for item in filtered_labels:
-            if level_name in item:
-                try:
-                    final_labels[levels[level]] = labels[filtered_labels[item]]
-                except Exception as e: # sometimes labels are NaN
-                    print("Error label", e)
-                    return None
-
-    return final_labels
-
 def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY):
     square = np.zeros((sizeX, sizeY), dtype=array.dtype)
     start_x = max(center_x - (sizeX // 2), 0)
@@ -57,7 +38,6 @@ def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY
     out_end_y = out_start_y + (end_y - start_y)
     square[out_start_x:out_end_x, out_start_y:out_end_y] = array[start_x:end_x, start_y:end_y]
     return square
-
 
 def z_score_normalization(image):
     mean = image.mean()
@@ -165,16 +145,14 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
     dataset = list()
     for study_id in tqdm.tqdm(studies_id, desc="Generates classification dataset"):
 
-        series_id = df_study_descriptions[(df_study_descriptions['study_id'] == study_id)
-                                        & (df_study_descriptions['series_description'] == crop_description)]['series_id'].to_list()
-        
-        for s_id in series_id:
-            coordinates_dict = df_study_coordinates[(df_study_coordinates['study_id'] == study_id)
-                                & (df_study_coordinates['condition'] == crop_condition)
-                                & (df_study_coordinates['series_id'] == s_id)].to_dict('records')
+        coordinates_dict = df_study_coordinates[(df_study_coordinates['study_id'] == study_id)
+                            & (df_study_coordinates['condition'] == crop_condition)
+                        ].to_dict('records')
 
-            # add to dataset only if all vertebraes in gt
-            if len(coordinates_dict) == len(LEVELS):
+        for coordinate in coordinates_dict:
+
+                pôhgf
+
                 all_slices_path = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
                 gt_labels = get_study_labels(study_id, df_study_labels, label_condition, LEVELS, LABELS)
 

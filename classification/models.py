@@ -210,41 +210,31 @@ class DynamicModelLoader:
         self.model_name = model_name
         self.num_classes = num_classes
         self.hidden_size = hidden_size
-        self.feature_size = self.get_feature_size()
         self.model = self.modify_classifier()
 
-    def get_feature_size(self):
-        with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 224, 224)
-            features = self.model.forward_features(dummy_input)
-            return features.shape[1]
-    
     def modify_classifier(self):
-        if 'vit_small_patch16_224' in self.model_name:
-                self.model.head = nn.Sequential(
-                    nn.Flatten(start_dim=1),
-                    nn.Linear(384, self.hidden_size),
-                )
+        if hasattr(self.model, 'fc'):
+            in_features = self.model.fc.in_features
+            self.model.fc = nn.Sequential(
+                nn.Linear(in_features, self.hidden_size),
+                nn.ReLU(),
+            )
+        elif hasattr(self.model, 'classifier'):
+            in_features = self.model.classifier.in_features
+            self.model.classifier = nn.Sequential(
+                nn.Linear(in_features, self.hidden_size),
+                nn.ReLU(),
+            )
+        elif hasattr(self.model, 'head'):
+            in_features = self.model.head.fc.in_features if hasattr(self.model.head, 'fc') else self.model.head.in_features
+            self.model.head = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(start_dim=1),
+                nn.Linear(in_features, self.hidden_size),
+                nn.ReLU(),
+            )
         else:
-            if hasattr(self.model, 'fc'):
-                in_features = self.model.fc.in_features
-                self.model.fc = nn.Sequential(
-                    nn.Linear(in_features, self.hidden_size),
-                )
-            elif hasattr(self.model, 'classifier'):
-                in_features = self.model.classifier.in_features
-                self.model.classifier = nn.Sequential(
-                    nn.Linear(in_features, self.hidden_size),
-                )
-            elif hasattr(self.model, 'head'):
-                in_features = self.model.head.fc.in_features if hasattr(self.model.head, 'fc') else self.model.head.in_features
-                self.model.head = nn.Sequential(
-                    nn.AdaptiveAvgPool2d((1, 1)),
-                    nn.Flatten(start_dim=1),
-                    nn.Linear(in_features, self.hidden_size),
-                )
-            else:
-                raise NotImplementedError("Unknown classifier structure")
+            raise NotImplementedError("Unknown classifier structure")
         return self.model
 
 
@@ -340,12 +330,14 @@ class REM(nn.Module):
         self.fold_classifiers = nn.ModuleList([
             FoldClassifier(features_size, n_classes) for _ in range(n_fold_classifier)
         ])
+        self.weights_encoders = nn.Parameter(torch.ones(len(backbones)))
+        self.weights_classifiers = nn.Parameter(torch.ones(n_fold_classifier))
 
     def forward_encoders(self, crop):
         encodeds = torch.stack([backbone(crop) for backbone in self.fold_backbones], dim=1)
         return encodeds
 
-    def forward_fold(self, crop, mode):
+    def forward(self, crop, mode):
         if mode == "train":
             r_b = torch.randint(0, self.n_fold_enc, (1,)).item()
             r_c = torch.randint(0, self.n_fold_cla, (1,)).item()
@@ -355,12 +347,14 @@ class REM(nn.Module):
             output = classifier(encoded)
             return output
 
-        if mode == "valid" or mode == "inference":
+        if mode == "inference":
             final_output = list()
-            _encodeds = self.forward_encoders(crop)
+            with torch.no_grad():
+                _encodeds = self.forward_encoders(crop)
             for classifier in self.fold_classifiers:
-                classified_ = torch.stack([classifier(_encodeds[:, i]) for i in range(self.n_fold_enc)], dim=1)
-                classifier_output = torch.mean(classified_, dim=1)
+                with torch.no_grad():
+                    classified_ = torch.stack([classifier(_encodeds[:, i]) for i in range(self.n_fold_enc)], dim=1)
+                classifier_output = torch.einsum("bsf,s->bf", classified_, torch.softmax(self.weights_encoders, dim=0))
                 final_output.append(classifier_output)
             final_output = torch.stack(final_output, dim=1)
             final_output = torch.mean(final_output, dim=1)

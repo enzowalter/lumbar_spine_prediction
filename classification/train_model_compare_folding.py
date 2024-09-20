@@ -266,8 +266,13 @@ class CropClassifierDataset(Dataset):
 ############################################################
 ############################################################
 
-def validate(model, loader, criterion, device):
-    model.eval()
+def validate_fold(models, loader, criterion, device):
+    mm = list()
+    for model in models:
+        model.eval()
+        model = model.cuda()
+        mm.append(model)
+    models = mm
     classification_loss_sum = 0
     all_predictions = []
     all_labels = []
@@ -275,7 +280,35 @@ def validate(model, loader, criterion, device):
     with torch.no_grad():
         for images, labels_gt in tqdm.tqdm(loader, desc="Valid"):
             labels_gt = labels_gt.to(device).long()
-            final_output = model(images.to(device), mode="inference")
+            
+            final_output = torch.stack([model(images.to(device)) for model in models], dim=1)
+            final_output = torch.mean(final_output, dim=1)
+
+            all_predictions.append(final_output.cpu())
+            all_labels.append(labels_gt.cpu())
+            
+            loss = criterion(final_output, labels_gt)
+            classification_loss_sum += loss.item()
+
+    all_predictions = torch.cat(all_predictions, dim=0).to(device)
+    all_labels = torch.cat(all_labels, dim=0).to(device)
+    
+    concat_loss = criterion(all_predictions, all_labels).item()
+    avg_classification_loss = classification_loss_sum / len(loader)
+    return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
+
+
+def validate(model, loader, criterion, device):
+    classification_loss_sum = 0
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+        for images, labels_gt in tqdm.tqdm(loader, desc="Valid"):
+            labels_gt = labels_gt.to(device).long()
+
+
+            final_output = model(images.to(device))
             
             all_predictions.append(final_output.cpu())
             all_labels.append(labels_gt.cpu())
@@ -290,20 +323,15 @@ def validate(model, loader, criterion, device):
     avg_classification_loss = classification_loss_sum / len(loader)
     return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
 
-def train_epoch(model, loader, criterion, optimizer, device, epoch):
+def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     epoch_loss = 0
     for images, labels in tqdm.tqdm(loader, desc="Training", total=len(loader)):
         optimizer.zero_grad()
         images = images.to(device)
         labels = labels.to(device).long()
-
-        # 1 epoch on 4 train all model
-        if epoch % 4 == 3:
-            predictions = model(images.to(device), mode="inference")
-        else:
-            predictions = model(images.to(device), mode="train")
-
+        
+        predictions = model(images.to(device))
         loss = criterion(predictions, labels)
         loss.backward()
         optimizer.step()
@@ -329,6 +357,9 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     #     features_size=384,
     # )
 
+    print("Test REM")
+
+    """
     model = REM(
         n_classes=3,
         n_fold_classifier=3,
@@ -341,24 +372,68 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, labe
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
-    for epoch in range(20):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
+    for epoch in range(10):
+        loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
             print("New best model !", model_name)
             best = metrics["concat_loss"]
-            print("Weights encoders", model.weights_encoders)
-            print("Weights classifiers", model.weights_classifiers)
             #torch.save(model.state_dict(), model_name)
         print('-' * 50)
+    """
+        
+    print("Test Folded")
 
-    print("Weights encoders", model.weights_encoders)
-    print("Weights classifiers", model.weights_classifiers)
-    return best
+    backbones=['ese_vovnet39b.ra_in1k', 'cspresnet50.ra_in1k', 'mobilenetv3_small_100.lamb_in1k', 'ecaresnet26t.ra2_in1k', 'resnet26t.ra2_in1k']
+    models = list()
+    for backbone in backbones:
+        model = SimpleClassifier(
+            encoder_name=backbone
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+
+        tmp_name = "__tmp__.pth"
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
+        criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
+        best = 123456
+        for epoch in range(8):
+            loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
+            metrics = validate(model, valid_loader, criterion, device)
+            print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
+            if metrics['concat_loss'] < best:
+                print("New best model !", model_name)
+                best = metrics["concat_loss"]
+                torch.save(model.state_dict(), tmp_name)
+            print('-' * 50)
+
+        model = SimpleClassifier(
+            encoder_name=backbone
+        )
+        model.load_state_dict(torch.load(tmp_name, map_location="cpu"))
+        models.append(model)
+
+    print("Testing with ensembling")
+    metrics = validate_fold(models, valid_loader, criterion, device)
+    print("ensembling metrics", metrics)
+
 
 if __name__ == "__main__":
 
+    best_logloss1 = train_submodel(
+                    input_dir="../../REFAIT",
+                    model_name="classification_spinal_canal_stenosis.pth",
+                    crop_condition="Spinal Canal Stenosis",
+                    label_condition="Spinal Canal Stenosis",
+                    crop_description="Sagittal T2/STIR",
+                    crop_size=(80, 120),
+                    image_resize=(640, 640),
+                    normalisation="clahe_norm_2"
+    )
+
+    """
     train_submodel(
                     input_dir="../../REFAIT",
                     model_name="classification_right_subarticular_stenosis_pipeline_dataset.pth",
@@ -369,9 +444,6 @@ if __name__ == "__main__":
                     image_resize=(640, 640),
                     normalisation="clahe_norm_2"
     )
-
-    sqdsfds
-
     train_submodel(
                     input_dir="../../REFAIT",
                     model_name="classification_left_subarticular_stenosis_pipeline_dataset.pth",
@@ -383,7 +455,6 @@ if __name__ == "__main__":
                     normalisation="clahe_norm_2"
     )
 
-    """
     best_logloss1 = train_submodel(
                     input_dir="../../REFAIT",
                     model_name="classification_spinal_canal_stenosis.pth",
