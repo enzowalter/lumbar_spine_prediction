@@ -190,4 +190,4 @@ def train_model(input_dir, conditions, description, model_name):
 
 
 if __name__ == "__main__":
-    train_model("../../REFAIT", ["Left Subarticular Stenosis"], "Axial T2", "model_slice_selection_axt2_left.ts")
+    train_model("../", ["Left Subarticular Stenosis"], "Axial T2", "model_slice_selection_axt2_left.ts")
