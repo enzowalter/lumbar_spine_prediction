@@ -65,7 +65,7 @@ class Upsampler(nn.Module):
         x = self.lastconv(x)
         return x
 
-class LumbarSegmentationModelAxial(nn.Module):
+class LumbarSegmentationModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.image_encoder = ImageEncoder()
