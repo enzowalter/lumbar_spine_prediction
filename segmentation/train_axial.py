@@ -82,7 +82,7 @@ def generate_dataset(input_dir, condition, description):
                     dataset_item['gt_positions'] = [x, y]
                     dataset_item['output_mask'][y-21:y+21,x-21:x+21] = 1
 
-                dataset.append(dataset_item)
+                    dataset.append(dataset_item)
     return dataset
 
 class SegmentationDataset(Dataset):
