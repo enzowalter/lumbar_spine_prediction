@@ -5,3 +5,5 @@
 *.jpg
 *.dcm
 *.csv
+*.pkl
+*.npy

@@ -16,6 +16,7 @@ from scipy.ndimage import label, center_of_mass
 import torch
 import torch.nn as nn
 import timm
+import pickle
 torch.set_grad_enabled(False) # remove grad for the script
 
 class DynamicModelLoader:
@@ -161,6 +162,11 @@ def load_model_classification(model_path):
 
 def load_torch_script_model(path):
     return torch.jit.load(path, map_location="cpu").eval().to(get_device())
+
+def load_pickle_model(path):
+    with open(path, 'rb') as f:
+        model = pickle.load(f)
+    return model.eval().to(get_device())
 
 ##########################################################
 #

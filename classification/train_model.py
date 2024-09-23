@@ -153,7 +153,7 @@ def cut_crops(slices_path, x, y, crop_size, image_resize, normalisation):
 ############################################################
 ############################################################
 
-def generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize):
+def generate_dataset(input_dir, crop_description, crop_condition, crop_size, image_resize):
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
     LABELS = {"Normal/Mild" : 0, "Moderate": 1, "Severe": 2}
 
@@ -176,46 +176,35 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
             # add to dataset only if all vertebraes in gt
             if len(coordinates_dict) == len(LEVELS):
                 all_slices_path = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
-                gt_labels = get_study_labels(study_id, df_study_labels, label_condition, LEVELS, LABELS)
+                gt_labels = get_study_labels(study_id, df_study_labels, crop_condition, LEVELS, LABELS)
 
                 if gt_labels is not None:
                     for coordinate in coordinates_dict:
                         try:
-                            dataset_item = dict()
-
-                            # get original slices
-                            dataset_item['slices_path'] = list()
+                            original_idx = None
                             for idx, sp in enumerate(all_slices_path):
                                 if get_instance(sp) == coordinate['instance_number']:
-                                    if idx == 0:
-                                        dataset_item['slices_path'].append(all_slices_path[idx])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx + 1])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx + 2])
-                                    elif idx == len(all_slices_path) - 1:
-                                        dataset_item['slices_path'].append(all_slices_path[idx - 2])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx - 1])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx])
-                                    else:
-                                        dataset_item['slices_path'].append(all_slices_path[idx - 1])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx])        
-                                        dataset_item['slices_path'].append(all_slices_path[idx + 1])
-
+                                    original_idx = idx
                                     break
 
-                            idx_level = LEVELS[coordinate['level']]
-                            x, y = coordinate['x'], coordinate['y']
-                            original_shape = pydicom.dcmread(f"{input_dir}/train_images/{study_id}/{s_id}/{coordinate['instance_number']}.dcm").pixel_array.shape
-                            x = int((x / original_shape[1]) * image_resize[1]) 
-                            y = int((y / original_shape[0]) * image_resize[0])
+                            if original_idx > 2 and original_idx < len(all_slices_path) - 3:
+                                idx_level = LEVELS[coordinate['level']]
+                                x, y = coordinate['x'], coordinate['y']
+                                original_shape = pydicom.dcmread(f"{input_dir}/train_images/{study_id}/{s_id}/{coordinate['instance_number']}.dcm").pixel_array.shape
+                                x = int((x / original_shape[1]) * image_resize[1]) 
+                                y = int((y / original_shape[0]) * image_resize[0])
 
-                            dataset_item['study_id'] = study_id
-                            dataset_item['series_id'] = s_id
-                            dataset_item['position'] = (x, y)
-                            dataset_item['gt_label'] = gt_labels[idx_level]
-                            dataset_item['crop_size'] = crop_size
-                            dataset_item['image_resize'] = image_resize
+                                dataset_item = dict()
+                                dataset_item['study_id'] = study_id
+                                dataset_item['all_slices'] = all_slices_path
+                                dataset_item['original_index'] = original_idx
+                                dataset_item['series_id'] = s_id
+                                dataset_item['position'] = (x, y)
+                                dataset_item['gt_label'] = gt_labels[idx_level]
+                                dataset_item['crop_size'] = crop_size
+                                dataset_item['image_resize'] = image_resize
 
-                            dataset.append(dataset_item)
+                                dataset.append(dataset_item)
 
                         except Exception as e:
                             print("Error add item", e)
@@ -230,10 +219,8 @@ def generate_dataset(input_dir, crop_description, crop_condition, label_conditio
 ############################################################
 
 def tensor_augmentations(tensor_image):
-    angle = random.uniform(-10, 10)
+    angle = random.uniform(-8, 8)
     tensor_image = FT.rotate(tensor_image, angle)
-    noise = torch.randn(tensor_image.size()) * 0.01
-    tensor_image = tensor_image + noise
     return tensor_image
 
 class CropClassifierDataset(Dataset):
@@ -247,14 +234,37 @@ class CropClassifierDataset(Dataset):
 
     def __getitem__(self, idx):
         data = self.datas[idx]
-        slices_to_use = data['slices_path']
         x, y = data['position']
+        original_idx = data['original_index']
+        all_slices_path = data['all_slices']
+
+        if self.is_train:
+            index_offets = [-2, -1, 0, 1, 2]
+            weights = [0.05, 0.1, 0.7, 0.1, 0.05]
+
+            offset = np.random.choice(index_offets, p=weights)
+            original_idx += offset
+
+        slices_path = list()
+
+        if original_idx == 0:
+            slices_path.append(all_slices_path[original_idx])        
+            slices_path.append(all_slices_path[original_idx + 1])        
+            slices_path.append(all_slices_path[original_idx + 2])
+        elif original_idx == len(all_slices_path) - 1:
+            slices_path.append(all_slices_path[original_idx - 2])        
+            slices_path.append(all_slices_path[original_idx - 1])        
+            slices_path.append(all_slices_path[original_idx])
+        else:
+            slices_path.append(all_slices_path[original_idx - 1])        
+            slices_path.append(all_slices_path[original_idx])        
+            slices_path.append(all_slices_path[original_idx + 1])
 
         if self.is_train:
             x += random.randint(-5, 6)
             y += random.randint(-5, 6)
 
-        crops = cut_crops(slices_to_use, x, y, data['crop_size'], data['image_resize'], self.normalisation)
+        crops = cut_crops(slices_path, x, y, data['crop_size'], data['image_resize'], self.normalisation)
         crops = torch.tensor(crops).float()
         if self.is_train:
             crops = tensor_augmentations(crops)
@@ -290,151 +300,102 @@ def validate(model, loader, criterion, device):
     avg_classification_loss = classification_loss_sum / len(loader)
     return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
 
-def train_epoch(model, loader, criterion, optimizer, device, epoch):
+def train_epoch(model, loader, criterion, optimizer_encoders, optimizer_gate, device, epoch):
     model.train()
     epoch_loss = 0
     for images, labels in tqdm.tqdm(loader, desc="Training", total=len(loader)):
-        optimizer.zero_grad()
+        optimizer_encoders.zero_grad()
+        optimizer_gate.zero_grad()
         images = images.to(device)
         labels = labels.to(device).long()
 
-        # 1 epoch on 4 train all model
-        if epoch % 4 == 3:
+        # Step by 4 epoch
+        # 0 = all
+        # 1 = diversity
+        # 2 = all
+        # 3 = gate
+
+        epoch_idx = epoch % 4
+        # train gate
+        if epoch_idx == 3:
             predictions = model(images.to(device), mode="inference")
+            loss = criterion(predictions, labels)
+            loss.backward()
+            optimizer_gate.step()
+            epoch_loss += loss.item() / len(loader)
+        # train diversity
+        # elif epoch_idx == 1:
+        #     loss = model(images.to(device), mode="diversity")
+        #     loss.backward()
+        #     optimizer_encoders.step()
+        #     epoch_loss += loss.item() / len(loader)
+        # train encoders + classifiers
         else:
             predictions = model(images.to(device), mode="train")
-
-        loss = criterion(predictions, labels)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item() / len(loader)
+            loss = criterion(predictions, labels)
+            loss.backward()
+            optimizer_encoders.step()
+            epoch_loss += loss.item() / len(loader)
 
     return epoch_loss
 
-def train_submodel(input_dir, model_name, crop_description, crop_condition, label_condition, crop_size, image_resize, normalisation):
+def train_submodel(input_dir, model_name, crop_description, crop_condition, crop_size, image_resize, normalisation):
 
     # get dataset
-    dataset = generate_dataset(input_dir, crop_description, crop_condition, label_condition, crop_size, image_resize)
+    dataset = generate_dataset(input_dir, crop_description, crop_condition, crop_size, image_resize)
     nb_valid = int(len(dataset) * 0.1)
     train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True, normalisation=normalisation)
     valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False, normalisation=normalisation)
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
     # get model
-    # model = FoldModelClassifier(
-    #     n_classes=3,
-    #     n_fold_classifier=3,
-    #     backbones=['densenet201.tv_in1k', 'seresnext101_32x4d.gluon_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'mobilenetv3_small_100.lamb_in1k'],
-    #     features_size=384,
-    # )
+
+    backbones_base = ['ese_vovnet39b.ra_in1k', 'cspresnet50.ra_in1k', 'mobilenetv3_small_100.lamb_in1k', 'ecaresnet26t.ra2_in1k', 'resnet26t.ra2_in1k']
+    backbones_large = ['convnext_tiny.fb_in1k', 'ese_vovnet39b.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'densenet161.tv_in1k', 'ecaresnet50d.miil_in1k']
+
+    # best 0.4953330159187317 bs 16 <= UTILISER LUI
+    backbones_large2 = ['cspresnet50.ra_in1k', 'convnext_large.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k']
+
+    backbones_convnext = ['convnext_xlarge.fb_in22k', 'convnext_large.fb_in22k_ft_in1k', 'convnext_base.fb_in22k_ft_in1k', 'convnext_small.in12k_ft_in1k', 'convnext_tiny.fb_in1k']
 
     model = REM(
         n_classes=3,
         n_fold_classifier=3,
-        backbones=['ese_vovnet39b.ra_in1k', 'cspresnet50.ra_in1k', 'mobilenetv3_small_100.lamb_in1k', 'ecaresnet26t.ra2_in1k', 'resnet26t.ra2_in1k'],
+        backbones=backbones_large2,
         features_size=256,
     )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
+    parameters_encoder = list(model.encoders.parameters()) + list(model.classifiers.parameters())
+    optimizer_encoders = torch.optim.AdamW(parameters_encoder, lr=0.0001)
+    optimizer_gate = torch.optim.AdamW([model.weights_encoders], lr=0.0005)
+    
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
-    for epoch in range(20):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
+    for epoch in range(19): # end train on gate
+        loss_train = train_epoch(model, train_loader, criterion, optimizer_encoders, optimizer_gate, device, epoch)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
             print("New best model !", model_name)
-            best = metrics["concat_loss"]
             print("Weights encoders", model.weights_encoders)
-            print("Weights classifiers", model.weights_classifiers)
-            #torch.save(model.state_dict(), model_name)
+            best = metrics["concat_loss"]
+            torch.save(model.state_dict(), model_name)
         print('-' * 50)
 
-    print("Weights encoders", model.weights_encoders)
-    print("Weights classifiers", model.weights_classifiers)
     return best
 
 if __name__ == "__main__":
 
     train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_right_subarticular_stenosis_pipeline_dataset.pth",
-                    crop_condition="Right Subarticular Stenosis",
-                    label_condition="Right Subarticular Stenosis",
-                    crop_description="Axial T2",
-                    crop_size=(164, 164),
-                    image_resize=(640, 640),
-                    normalisation="clahe_norm_2"
+        input_dir="../",
+        model_name="classification_st1_left.pth",
+        crop_condition="Left Neural Foraminal Narrowing",
+        crop_description="Sagittal T1",
+        crop_size=(80, 120),
+        image_resize=(640, 640),
+        normalisation="clahe_norm_2"
     )
-
-    sqdsfds
-
-    train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_left_subarticular_stenosis_pipeline_dataset.pth",
-                    crop_condition="Left Subarticular Stenosis",
-                    label_condition="Left Subarticular Stenosis",
-                    crop_description="Axial T2",
-                    crop_size=(164, 164),
-                    image_resize=(640, 640),
-                    normalisation="clahe_norm_2"
-    )
-
-    """
-    best_logloss1 = train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_spinal_canal_stenosis.pth",
-                    crop_condition="Spinal Canal Stenosis",
-                    label_condition="Spinal Canal Stenosis",
-                    crop_description="Sagittal T2/STIR",
-                    crop_size=(80, 120),
-                    image_resize=(640, 640),
-    )
-
-    best_logloss2 = train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_left_neural_foraminal_narrowing.pth",
-                    crop_condition="Left Neural Foraminal Narrowing",
-                    label_condition="Left Neural Foraminal Narrowing",
-                    crop_description="Sagittal T1",
-                    crop_size=(64, 96),
-                    image_resize=(640, 640),
-    )
-    best_logloss3 = train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_right_neural_foraminal_narrowing.pth",
-                    crop_condition="Right Neural Foraminal Narrowing",
-                    label_condition="Right Neural Foraminal Narrowing",
-                    crop_description="Sagittal T1",
-                    crop_size=(64, 96),
-                    image_resize=(640, 640),
-    )
-    best_logloss4 = train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_right_subarticular_stenosis.pth",
-                    crop_condition="Right Subarticular Stenosis",
-                    label_condition="Right Subarticular Stenosis",
-                    crop_description="Axial T2",
-                    crop_size=(96, 96),
-                    image_resize=(720, 720),
-    )
-    best_logloss5 = train_submodel(
-                    input_dir="../../REFAIT",
-                    model_name="classification_left_subarticular_stenosis.pth",
-                    crop_condition="Left Subarticular Stenosis",
-                    label_condition="Left Subarticular Stenosis",
-                    crop_description="Axial T2",
-                    crop_size=(96, 96),
-                    image_resize=(720, 720),
-    )
-    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
-    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
-    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
-    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
-    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
-    print("F>DDFQSSQDF>FDJK>DKJF>DJK")
-    print(best_logloss1, best_logloss2, best_logloss3, best_logloss4, best_logloss5)
-    """
