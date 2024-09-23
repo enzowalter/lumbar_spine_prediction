@@ -43,7 +43,7 @@ class ImageEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = timm.create_model(
-                        'convnext_tiny.in12k_ft_in1k',
+                        'convnext_small.in12k_ft_in1k',
                         pretrained=False,
         )
 
@@ -52,7 +52,7 @@ class ImageEncoder(nn.Module):
         features = torch.mean(x, dim = (2, 3))
         return features
 
-class SagittalSliceSelecterModelTorchscript(nn.Module):
+class SelecterModelTorchscript(nn.Module):
     def __init__(self):
         super().__init__()
         self.image_encoder = ImageEncoder()
@@ -75,11 +75,10 @@ def convert_to_ts(f, t):
     
     model = model.eval().cpu()
     
-    new_model = SagittalSliceSelecterModelTorchscript()
+    new_model = SelecterModelTorchscript()
     new_model.load_state_dict(model.state_dict())
     scripted_model = torch.jit.script(new_model)
     scripted_model.save(t)
 
 if __name__ == "__main__":
-
-    convert_to_ts("../trained_models/v6/model_slice_selection_st2.pkl", "../trained_models/v6/model_slice_selection_st2.ts")
+    convert_to_ts("model_slice_selection_axt2_right.pkl", "model_slice_selection_axt2_right_scripted.ts")

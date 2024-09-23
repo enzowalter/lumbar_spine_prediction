@@ -41,7 +41,7 @@ class ImageEncoder(nn.Module):
         #self.backbone = torchvision.models.mnasnet0_5(weights="DEFAULT")
 
         self.model = timm.create_model(
-                        'convnext_tiny.in12k_ft_in1k',
+                        'convnext_small.in12k_ft_in1k',
                         pretrained=True,
         )
         #self.encoder = CustomEncoder()

@@ -220,11 +220,11 @@ def train_model(input_dir, condition, description, model_name):
     return best_metrics
 
 if __name__ == "__main__":
-    # train_model("../", "Right Subarticular Stenosis", "Axial T2", "model_slice_selection_axt2_right.pkl")
-    # convert_to_ts("model_slice_selection_axt2_right.pkl", "model_slice_selection_axt2_right_scripted.ts")
+    train_model("../", "Right Subarticular Stenosis", "Axial T2", "model_slice_selection_axt2_right.pkl")
+    convert_to_ts("model_slice_selection_axt2_right.pkl", "model_slice_selection_axt2_right_scripted.ts")
     
-    train_model("../", "Left Subarticular Stenosis", "Axial T2", "model_slice_selection_axt2_left.pkl")
-    convert_to_ts("model_slice_selection_axt2_left.pkl", "model_slice_selection_axt2_left_scripted.ts")
+    # train_model("../", "Left Subarticular Stenosis", "Axial T2", "model_slice_selection_axt2_left.pkl")
+    # convert_to_ts("model_slice_selection_axt2_left.pkl", "model_slice_selection_axt2_left_scripted.ts")
 
     # train_model("../", "Left Neural Foraminal Narrowing", "Sagittal T1", "model_slice_selection_st1_left.pkl")
 
