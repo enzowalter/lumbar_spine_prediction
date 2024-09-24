@@ -279,17 +279,19 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, crop
 
     parameters_encoder = list(model.encoders.parameters()) + list(model.classifiers.parameters())
     optimizer_encoders = torch.optim.AdamW(parameters_encoder, lr=0.0001)
-    optimizer_gate = torch.optim.AdamW([model.weights_encoders], lr=0.0005)
-    
+    optimizer_gate = torch.optim.AdamW([
+        {'params': parameters_encoder, 'lr': 0.00005},
+        {'params': [model.weights_encoders], 'lr': 0.0005}
+    ])
+
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
-    for epoch in range(21): # end train on gate
+    for epoch in range(20):
         loss_train = train_epoch(model, train_loader, criterion, optimizer_encoders, optimizer_gate, device, epoch)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
-            print("New best model !", model_name)
-            print("Weights encoders", model.weights_encoders)
+            print("New best model !", "Weights encoders", model.weights_encoders)
             best = metrics["concat_loss"]
             torch.save(model.state_dict(), model_name)
         print('-' * 50)
@@ -298,11 +300,30 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, crop
 
 if __name__ == "__main__":
 
-    train_submodel(
-        input_dir="../",
-        model_name="classification_st1_left.pth",
-        crop_condition="Left Neural Foraminal Narrowing",
-        crop_description="Sagittal T1",
-        crop_size=(80, 120),
-        image_resize=(640, 640),
-    )
+    conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis", "Left Subarticular Stenosis", "Right Subarticular Stenosis"]
+    descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR", "Axial T2", "Axial T2"]
+    crop_sizes = [(64, 96), (64, 96), (64, 96), (184, 184), (184, 184)]
+    out_name = ["classification_st1_left.pth", "classification_st1_right.pth", "classification_st2.pth", "classification_ax_left.pth", "classification_ax_right.pth"]
+
+    metrics = dict()
+
+    for cond, desc, csize, out in zip(conditions, descriptions, crop_sizes, out_name):
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        print("Training:", cond)
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        best = train_submodel(
+            input_dir="../",
+            model_name=out,
+            crop_condition=cond,
+            crop_description=desc,
+            crop_size=csize,
+            image_resize=(640, 640),
+        )
+        metrics[cond] = best
+
+    print("Done !")
+    print(metrics)
