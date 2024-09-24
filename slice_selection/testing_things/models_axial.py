@@ -10,10 +10,6 @@ class ImageEncoder(nn.Module):
                         pretrained=True,
         )
 
-        # tiny = 0.9098076372398568 f1
-        # small = 0.9265487995731697 f1
-        # base = 0.921396780326511
-
     def forward(self, x):
         x = self.model.forward_features(x)[:, 0]
         return x

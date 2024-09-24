@@ -9,6 +9,7 @@ import glob
 import torch
 import pickle
 import pathlib
+import shutil
 
 from models import SagittalSliceSelecterModel
 from convert_to_ts import convert_to_ts
@@ -16,7 +17,7 @@ from convert_to_ts import convert_to_ts
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
 
-def generate_scores(num_images, index):
+def generate_scores_sagittal(num_images, index):
     scores = np.zeros(num_images)
     for i in range(num_images):
         distance = abs(i - index)
@@ -24,7 +25,25 @@ def generate_scores(num_images, index):
         scores[i] = score
     return scores
 
-def generate_dataset(input_dir, condition, description):
+def generate_scores_axial(num_images, index):
+    scores = np.zeros(num_images)
+    scores[index] = 1
+    if index > 0:
+        scores[index - 1] = 0.5
+    if index < num_images - 1:
+        scores[index + 1] = 0.5
+    return scores
+
+def generate_dataset(input_dir, condition, description, scores_fct):
+
+    # Reset tmp folder
+    output_folder = "_tmp_"
+    try:
+        shutil.rmtree(output_folder)
+    except:
+        pass
+    pathlib.Path(output_folder).mkdir(exist_ok=True, parents=True)
+
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
 
     df_study_labels = pd.read_csv(f"{input_dir}/train.csv")
@@ -58,8 +77,6 @@ def generate_dataset(input_dir, condition, description):
                 dataset_item['gt_indices'] = np.zeros(len(LEVELS))
 
                 # Preprocess images
-                output_folder = "_tmp2_"
-                pathlib.Path(output_folder).mkdir(exist_ok=True, parents=True)
                 images_preprocessed = np.zeros((len(dataset_item['slices_path']), 1, 224, 224))
                 for k, path in enumerate(dataset_item['slices_path']):
                     im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
@@ -84,7 +101,7 @@ def generate_dataset(input_dir, condition, description):
                     if instance_index is None:
                         raise Exception("Error in GT !")
                     dataset_item['gt_indices'][idx_level] = instance_index
-                    dataset_item['labels'][idx_level] = generate_scores(dataset_item['nb_slices'], instance_index)
+                    dataset_item['labels'][idx_level] = scores_fct(dataset_item['nb_slices'], instance_index)
 
                 dataset.append(dataset_item)
     return dataset
@@ -174,10 +191,10 @@ def train_epoch(model, loader, criterion, optimizer, accumulation_step, device):
 
     return epoch_loss
 
-def train_model(input_dir, condition, description, model_name):
+def train_model(input_dir, condition, description, model_name, scores_fct):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = generate_dataset(input_dir, condition, description)
+    dataset = generate_dataset(input_dir, condition, description, scores_fct)
 
     nb_valid = int(len(dataset) * 0.1)
     train_dataset = SlicePredicterDataset(dataset[nb_valid:])
@@ -195,39 +212,42 @@ def train_model(input_dir, condition, description, model_name):
 
     best_metrics = None
     best = -1
-    for epoch in range(10):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, 32, device)
+    for epoch in range(20):
+        loss_train = train_epoch(model, train_loader, criterion, optimizer, 16, device)
         loss_valid, instance_accuracy = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "valid_loss=", loss_valid, "instance_accuracy=", instance_accuracy)
         if instance_accuracy[3] > best:
             print("New best model !", model_name)
             best = instance_accuracy[3]
             best_metrics = instance_accuracy
-            with open(model_name, 'wb') as f:
-                pickle.dump(model, f)
-
+            scripted_model = torch.jit.script(model)
+            scripted_model.save(model_name)
         print("-" * 55)
-    
-    print("-" * 55)
-    print("-" * 55)
-    print("-" * 55)
-    print("DONE !")
-    print("Model saved:", model_name)
-    print("Best metrics:", best_metrics)
-    print("-" * 55)
-    print("-" * 55)
-    print("-" * 55)
+
     return best_metrics
 
 if __name__ == "__main__":
-    train_model("../", "Right Subarticular Stenosis", "Axial T2", "model_slice_selection_axt2_right.pkl")
-    convert_to_ts("model_slice_selection_axt2_right.pkl", "model_slice_selection_axt2_right_scripted.ts")
-    
-    # train_model("../", "Left Subarticular Stenosis", "Axial T2", "model_slice_selection_axt2_left.pkl")
-    # convert_to_ts("model_slice_selection_axt2_left.pkl", "model_slice_selection_axt2_left_scripted.ts")
+    conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis", "Left Subarticular Stenosis", "Right Subarticular Stenosis"]
+    descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR", "Axial T2", "Axial T2"]
+    out_name = ["slice_selector_st1_left.ts", "slice_selector_st1_right.ts", "slice_selector_st2.ts", "slice_selector_ax_left.ts", "slice_selector_ax_right.ts"]
+    scores_fct = [generate_scores_sagittal, generate_scores_sagittal, generate_scores_sagittal, generate_scores_axial, generate_scores_axial]
+    metrics = dict()
 
-    # train_model("../", "Left Neural Foraminal Narrowing", "Sagittal T1", "model_slice_selection_st1_left.pkl")
-
-    # train_model("../", "Right Neural Foraminal Narrowing", "Sagittal T1", "model_slice_selection_st1_right.pkl")
-
-    # train_model("../", "Spinal Canal Stenosis", "Sagittal T2/STIR", "model_slice_selection_st2.pkl")
+    for cond, desc, out, fct in zip(conditions, descriptions, out_name, scores_fct):
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        print("Training:", cond)
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        best = train_model(
+            input_dir="../",
+            model_name=out,
+            condition=cond,
+            description=desc,
+            scores_fct=fct,
+        )
+        metrics[cond] = best
+    print("Done !")
+    print(metrics)
