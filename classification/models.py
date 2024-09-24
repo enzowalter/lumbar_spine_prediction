@@ -35,7 +35,6 @@ class REM_ModelLoader:
             raise NotImplementedError("Unknown classifier structure")
         return self.model
 
-
 class REM_Encoder(nn.Module):
     def __init__(self, features_size, backbone_name):
         super().__init__()
@@ -76,39 +75,8 @@ class REM(nn.Module):
         encodeds = torch.stack([encoder(crop) for encoder in self.encoders], dim=1)
         return encodeds
 
-    def _variance_loss(self, encodings):
-        """
-        Maximizes the variance between different encoders' outputs
-        """
-        batch_size, num_encoders, feature_dim = encodings.shape
-        avg_features = encodings.mean(dim=1)
-        diversity = torch.var(avg_features, dim=0).mean()
-        return -diversity
-
-    def _diversity_loss(self, encodeds):
-        batch_size, num_encoders, features_size = encodeds.shape
-        
-        diversity_loss = 0.0
-        for i in range(self.nb_encoders):
-            for j in range(i + 1, self.nb_encoders):
-                encoded_i = encodeds[:, i, :]
-                encoded_j = encodeds[:, j, :]
-                
-                encoded_i = F.normalize(encoded_i, p=2, dim=-1)
-                encoded_j = F.normalize(encoded_j, p=2, dim=-1)
-                
-                cosine_similarity = (encoded_i * encoded_j).sum(dim=-1)
-                diversity_loss += cosine_similarity.mean()
-
-        diversity_loss = diversity_loss / (num_encoders * (num_encoders - 1) / 2)
-        return diversity_loss
-
-    def compute_diversity_loss(self, encodeds):
-        loss_d = self._diversity_loss(encodeds)
-        loss_v = self._variance_loss(encodeds)
-        return (loss_d * 0.9 + loss_v * 0.1)
-
     def forward(self, crop, mode):
+        
         if mode == "train":
             r_b = torch.randint(0, self.nb_encoders, (1,)).item()
             r_c = torch.randint(0, self.nb_classifiers, (1,)).item()
@@ -117,11 +85,6 @@ class REM(nn.Module):
             encoded = backbone(crop)
             output = classifier(encoded)
             return output
-
-        if mode == "diversity":
-            _encodeds = self.forward_encoders(crop)
-            loss = self.compute_diversity_loss(_encodeds)
-            return loss
 
         if mode == "inference":
             final_output = list()
