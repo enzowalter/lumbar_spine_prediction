@@ -41,10 +41,6 @@ class CropEncoder(nn.Module):
     def __init__(self, features_size):
         super().__init__()
         self.backbone = DynamicModelLoader('convnext_base.fb_in22k_ft_in1k', hidden_size=features_size).model
-        #self.backbone = DynamicModelLoader('convnext_small.in12k_ft_in1k', hidden_size=features_size).model
-        #self.backbone = torchvision.models.squeezenet1_0(weights="DEFAULT")
-
-        # convnext tiny => metrics= {'loss': 0.3717653508964949, 'accuracy_top1': 0.783975659229209, 'accuracy_top3': 0.9979716024340771, 'error_distance': 1.0375586854460095}
 
     def forward(self, x):
         features = self.backbone.forward_features(x)

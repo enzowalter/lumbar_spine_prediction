@@ -16,12 +16,103 @@ from scipy.ndimage import label, center_of_mass
 import torch
 import torch.nn as nn
 import timm
-import pickle
 torch.set_grad_enabled(False) # remove grad for the script
 
+####################################################
+#        CLASSIFICATION
+####################################################
+
+
+class REM_ModelLoader:
+    def __init__(self, model_name, hidden_size=256):
+        self.model = timm.create_model(model_name, pretrained=False)
+        self.model_name = model_name
+        self.hidden_size = hidden_size
+        self.model = self.modify_classifier()
+
+    def modify_classifier(self):
+        if hasattr(self.model, 'fc'):
+            in_features = self.model.fc.in_features
+            self.model.fc = nn.Sequential(
+                nn.Linear(in_features, self.hidden_size),
+                nn.ReLU(),
+            )
+        elif hasattr(self.model, 'classifier'):
+            in_features = self.model.classifier.in_features
+            self.model.classifier = nn.Sequential(
+                nn.Linear(in_features, self.hidden_size),
+                nn.ReLU(),
+            )
+        elif hasattr(self.model, 'head'):
+            in_features = self.model.head.fc.in_features if hasattr(self.model.head, 'fc') else self.model.head.in_features
+            self.model.head = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(start_dim=1),
+                nn.Linear(in_features, self.hidden_size),
+            )
+        else:
+            raise NotImplementedError("Unknown classifier structure")
+        return self.model
+
+class REM_Encoder(nn.Module):
+    def __init__(self, features_size, backbone_name):
+        super().__init__()
+        self.name = backbone_name
+        self.model = REM_ModelLoader(model_name=backbone_name, hidden_size=features_size).model
+    def forward(self, x):
+        return self.model(x)
+
+class REM_Classifier(nn.Module):
+    def __init__(self, in_features, n_classes):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features, in_features // 4),
+            nn.ReLU(),
+            nn.Linear(in_features // 4, n_classes)
+        )
+    def forward(self, x):
+        x = self.classifier(x)
+        return x
+
+class REM(nn.Module):
+    def __init__(self, backbones, n_fold_classifier, features_size, n_classes):
+        super().__init__()
+        self.nb_encoders = len(backbones)
+        self.nb_classifiers = n_fold_classifier
+        self.features_size = features_size
+        self.n_classes = n_classes
+        
+        self.encoders = nn.ModuleList([
+            REM_Encoder(features_size, backbone) for backbone in backbones
+        ])
+        self.classifiers = nn.ModuleList([
+            REM_Classifier(features_size, n_classes) for _ in range(n_fold_classifier)
+        ])
+        self.weights_encoders = nn.Parameter(torch.ones(len(self.encoders)))
+
+    def forward_encoders(self, crop):
+        encodeds = torch.stack([encoder(crop) for encoder in self.encoders], dim=1)
+        return encodeds
+
+    def forward(self, crop):
+        final_output = list()
+        _encodeds = self.forward_encoders(crop)
+        for classifier in self.classifiers:
+            classified_ = torch.stack([classifier(_encodeds[:, i]) for i in range(self.nb_encoders)], dim=1)
+            classifier_output = torch.einsum("bsf,s->bf", classified_, torch.softmax(self.weights_encoders, dim=0))
+            final_output.append(classifier_output)
+        final_output = torch.stack(final_output, dim=1)
+        final_output = torch.mean(final_output, dim=1)
+        return final_output
+
+
+####################################################
+#        CROP SELECTION
+####################################################
+
 class DynamicModelLoader:
-    def __init__(self, model_name, pretrained=True, hidden_size=None):
-        self.model = timm.create_model(model_name, pretrained=pretrained)
+    def __init__(self, model_name, hidden_size=None):
+        self.model = timm.create_model(model_name, pretrained=False)
         self.model_name = model_name
         self.hidden_size = hidden_size
         if hidden_size is not None:
@@ -52,14 +143,10 @@ class DynamicModelLoader:
             raise NotImplementedError("Unknown classifier structure")
         return self.model
 
-####################################################
-#        CROP SELECTION
-
 class CropEncoder(nn.Module):
-    def __init__(self, model_name, feature_size=1024):
+    def __init__(self, model_name, features_size):
         super().__init__()
-        # hidden useless but in weight.pth
-        self.backbone = DynamicModelLoader(model_name, hidden_size=feature_size).model
+        self.backbone = DynamicModelLoader(model_name, hidden_size=features_size).model
 
     def forward(self, x):
         features = self.backbone.forward_features(x)
@@ -67,10 +154,11 @@ class CropEncoder(nn.Module):
         return features
 
 class CropSelecter(nn.Module):
+
     def __init__(self, model_name):
         super().__init__()
         self.features_size = 1024
-        self.encoder = CropEncoder(model_name)
+        self.encoder = CropEncoder(model_name, self.features_size)
         self.lstm = nn.LSTM(self.features_size, self.features_size // 4, bidirectional=True, batch_first=True, dropout=0.021, num_layers=2)
         self.classifier = nn.Linear(self.features_size // 2, 1)
 
@@ -82,7 +170,6 @@ class CropSelecter(nn.Module):
         lstm_out, _ = self.lstm(features)
         scores = self.classifier(lstm_out)
         return scores.sigmoid().squeeze(-1)
-
 
 ##########################################################
 #
@@ -139,16 +226,16 @@ def get_best_slice_selection(config, pathes, topk):
         im = (im - im.min()) / (im.max() - im.min() + 1e-9)
         images[k, 0, ...] = im
     images = torch.tensor(images).expand(nb_slices, 3, *config['slice_input_size']).float()
-    preds_logits, preds_softmax = config['models']['slice_selecter'](images.to(config["device"]).unsqueeze(0))
-    preds_softmax = preds_softmax.squeeze()
-    preds_overall = torch.sum(preds_softmax, dim=0)
+    preds_model = config['models']['slice_selecter'](images.to(config["device"]).unsqueeze(0))
+    preds_model = preds_model.squeeze()
+    preds_overall = torch.sum(preds_model, dim=0)
 
     # get best 3 by level
     slices_by_level = [
-        {"pathes": list(), "values": list()} for _ in range(preds_softmax.shape[0])
+        {"pathes": list(), "values": list()} for _ in range(preds_model.shape[0])
     ]
-    for level in range(preds_softmax.shape[0]):
-        pred_level = preds_softmax[level, :]
+    for level in range(preds_model.shape[0]):
+        pred_level = preds_model[level, :]
         values, max_indice = get_max_consecutive_N(pred_level, 3)
         slices_by_level[level]['pathes'] = [pathes[i] for i in max_indice]
         slices_by_level[level]['values'] = [v for v in values]
@@ -161,10 +248,10 @@ def get_best_slice_selection(config, pathes, topk):
 
     # get best 8 by level (for crop selection)
     slices8_by_level = [
-        {"pathes": list(), "values": list()} for _ in range(preds_softmax.shape[0])
+        {"pathes": list(), "values": list()} for _ in range(preds_model.shape[0])
     ]
-    for level in range(preds_softmax.shape[0]):
-        pred_level = preds_softmax[level, :]
+    for level in range(preds_model.shape[0]):
+        pred_level = preds_model[level, :]
         values, max_indice = get_max_consecutive_N(pred_level, 8)
         slices8_by_level[level]['pathes'] = [pathes[i] for i in max_indice]
         slices8_by_level[level]['values'] = [v for v in values]
@@ -333,7 +420,7 @@ def get_8crops_by_level(slices_to_use, position_by_level, config):
             py = int(position[1] * config['crop_selecter_resize_image'][0])
             crops_output[level, ...] = cut_crops(slices, px, py, config['crop_selecter_crop_size'], config['crop_selecter_resize_image'])
         else:
-            print("No prediction on segmentation !", level)
+            print("No prediction on segmentation !", level, "for", config["condition"])
 
     crops_output = torch.tensor(crops_output).float().to(config["device"])
     crops_output = crops_output.unsqueeze(2).expand(5, 8, 3, 128, 128)
@@ -359,7 +446,7 @@ def compute_best3_by_level(crops, config):
 ##########################################################
 
 def get_classification(crops: torch.tensor, config):
-    preds = config['model_classification'](crops)
+    preds = config['models']['classifier'](crops.to(get_device()))
     preds = torch.softmax(preds, dim=1)
     return preds
 
@@ -382,7 +469,15 @@ def load_models(task):
     crops_selecter = crops_selecter.eval().to(get_device())
 
     # load classification
-    classifier = None
+    backbones = task['class_backbones']
+    classifier = REM(
+        n_classes=3,
+        n_fold_classifier=3,
+        backbones=backbones,
+        features_size=256,
+    )
+    classifier.load_state_dict(torch.load(task['class_model_path'], map_location="cpu", weights_only=True))
+    classifier = classifier.eval().to(get_device())
 
     return {
         "slice_selecter": slice_selecter,
@@ -393,12 +488,13 @@ def load_models(task):
 
 def get_tasks_metadatas():
     tasks = [
+        # SPINAL CANAL STENOSIS
         {   
             # MODELS
-            "slice_model_path": "trained_models/v6/model_slice_selection_st2_scripted.ts",
+            "slice_model_path": "trained_models/v6/slice_selector_st2.ts",
             "seg_model_path": "trained_models/v6/model_segmentation_st2.ts",
             "crops_model_path": "trained_models/v6/model_crop_selection_st2.pth",
-            "class_model_path": "trained_models/v6/classification_spinal_canal_stenosis_pipeline_dataset.pth",
+            "class_model_path": "trained_models/v6/classification_st2.pth",
             
             # GENERAL
             "description": "Sagittal T2/STIR",
@@ -415,12 +511,149 @@ def get_tasks_metadatas():
 
             #   => crop selection
             "crop_selecter_backbone": 'convnext_base.fb_in22k_ft_in1k',
-            "crop_selecter_crop_size": (80, 120),
+            "crop_selecter_crop_size": (64, 96),
             "crop_selecter_resize_image": (640, 640),
             "crop_selecter_input_size": (128, 128),
 
             #   => classification
-            "class_crop_size": (80, 120),
+            "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
+            "class_crop_size": (64, 96),
+            "class_resize_image": (640, 640),
+            "class_input_size": (128, 128),
+        },
+        
+        # LEFT NEURAL FORAMINAL NARROWING
+        {   
+            # MODELS
+            "slice_model_path": "trained_models/v6/slice_selector_st1_left.ts",
+            "seg_model_path": "trained_models/v6/model_segmentation_st1_left.ts",
+            "crops_model_path": "trained_models/v6/model_crop_selection_st1_left.pth",
+            "class_model_path": "trained_models/v6/classification_st1_left.pth",
+            
+            # GENERAL
+            "description": "Sagittal T1",
+            "condition": "Left Neural Foraminal Narrowing",
+
+            # HYPERPARAMETERS
+            #   => slice selection
+            "slice_input_size": (224, 224),
+
+            #   => segmentation
+            "segmentation_slice_selection": 'best_overall',
+            "seg_input_size": (384, 384),
+            "seg_mask_size": (384, 384), # unused
+
+            #   => crop selection
+            "crop_selecter_backbone": 'convnext_base.fb_in22k_ft_in1k',
+            "crop_selecter_crop_size": (64, 96),
+            "crop_selecter_resize_image": (640, 640),
+            "crop_selecter_input_size": (128, 128),
+
+            #   => classification
+            "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
+            "class_crop_size": (64, 96),
+            "class_resize_image": (640, 640),
+            "class_input_size": (128, 128),
+        },
+
+        # RIGHT NEURAL FORAMINAL NARROWING
+        {   
+            # MODELS
+            "slice_model_path": "trained_models/v6/slice_selector_st1_right.ts",
+            "seg_model_path": "trained_models/v6/model_segmentation_st1_right.ts",
+            "crops_model_path": "trained_models/v6/model_crop_selection_st1_right.pth",
+            "class_model_path": "trained_models/v6/classification_st1_right.pth",
+            
+            # GENERAL
+            "description": "Sagittal T1",
+            "condition": "Right Neural Foraminal Narrowing",
+
+            # HYPERPARAMETERS
+            #   => slice selection
+            "slice_input_size": (224, 224),
+
+            #   => segmentation
+            "segmentation_slice_selection": 'best_overall',
+            "seg_input_size": (384, 384),
+            "seg_mask_size": (384, 384), # unused
+
+            #   => crop selection
+            "crop_selecter_backbone": 'convnext_base.fb_in22k_ft_in1k',
+            "crop_selecter_crop_size": (64, 96),
+            "crop_selecter_resize_image": (640, 640),
+            "crop_selecter_input_size": (128, 128),
+
+            #   => classification
+            "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
+            "class_crop_size": (64, 96),
+            "class_resize_image": (640, 640),
+            "class_input_size": (128, 128),
+        },
+
+        # RIGHT SUBARTICULAR STENOSIS
+        {   
+            # MODELS
+            "slice_model_path": "trained_models/v6/slice_selector_ax_right.ts",
+            "seg_model_path": "trained_models/v6/model_segmentation_ax_right.ts",
+            "crops_model_path": "trained_models/v6/model_crop_selection_ax_right.pth",
+            "class_model_path": "trained_models/v6/classification_ax_right.pth",
+            
+            # GENERAL
+            "description": "Axial T2",
+            "condition": "Right Subarticular Stenosis",
+
+            # HYPERPARAMETERS
+            #   => slice selection
+            "slice_input_size": (224, 224),
+
+            #   => segmentation
+            "segmentation_slice_selection": 'best_by_level',
+            "seg_input_size": (384, 384),
+            "seg_mask_size": (384, 384), # unused
+
+            #   => crop selection
+            "crop_selecter_backbone": 'convnext_base.fb_in22k_ft_in1k',
+            "crop_selecter_crop_size": (184, 184),
+            "crop_selecter_resize_image": (640, 640),
+            "crop_selecter_input_size": (128, 128),
+
+            #   => classification
+            "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
+            "class_crop_size": (184, 184),
+            "class_resize_image": (640, 640),
+            "class_input_size": (128, 128),
+        },
+
+        # LEFT SUBARTICULAR STENOSIS
+        {   
+            # MODELS
+            "slice_model_path": "trained_models/v6/slice_selector_ax_left.ts",
+            "seg_model_path": "trained_models/v6/model_segmentation_ax_left.ts",
+            "crops_model_path": "trained_models/v6/model_crop_selection_ax_left.pth",
+            "class_model_path": "trained_models/v6/classification_ax_left.pth",
+            
+            # GENERAL
+            "description": "Axial T2",
+            "condition": "Left Subarticular Stenosis",
+
+            # HYPERPARAMETERS
+            #   => slice selection
+            "slice_input_size": (224, 224),
+
+            #   => segmentation
+            "segmentation_slice_selection": 'best_by_level',
+            "seg_input_size": (384, 384),
+            "seg_mask_size": (384, 384), # unused
+
+            #   => crop selection
+            "crop_selecter_backbone": 'convnext_base.fb_in22k_ft_in1k',
+            "crop_selecter_crop_size": (184, 184),
+            "crop_selecter_resize_image": (640, 640),
+            "crop_selecter_input_size": (128, 128),
+
+            #   => classification
+            "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
+            "class_crop_size": (184, 184),
             "class_resize_image": (640, 640),
             "class_input_size": (128, 128),
         },
@@ -444,33 +677,9 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict, study_id: int) ->
             best_overall=best_slices_overall,
             best_8_by_level=slices8_by_level,
         )
-
-        # print("best_by_level")
-        # for level in range(5):
-        #     print(slices_to_use['best_by_level'][level])
-
-        # print()
-        # print("best_overall")
-        # print(slices_to_use['best_overall'])
-
-        # print()
-        # print("best_8_by_level")
-        # for level in range(5):
-        #     print(slices_to_use['best_8_by_level'][level])
-
         positions_by_level = get_position_by_level(slices_to_use, config)
-
-        # print()
-        # print("positions")
-        # for level in range(5):
-        #     print(positions_by_level[level])
-
         crops_by_level = get_8crops_by_level(slices_to_use, positions_by_level, config)
         crops_for_classification = compute_best3_by_level(crops_by_level, config)
-
-        # for level in range(5):
-        #     for channel in range(3):
-        #         cv2.imwrite(f"selected_crop_{level}_{channel}.jpg", crops_for_classification[level, channel].detach().cpu().numpy() * 255)
 
         classification_results = get_classification(crops_for_classification, config)
 
@@ -515,4 +724,4 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
 
 if __name__ == "__main__":
     df = compute_pipeline("train_images/", "train_series_descriptions.csv", 10)
-    df.to_csv("pipeline_preds.csv")
+    df.to_csv("pipeline_preds.csv", index=False)
