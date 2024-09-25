@@ -274,6 +274,9 @@ def get_slices_to_use(study_id, series_ids, config):
     # compute best slices for each series
     best_slices_per_series = dict()
     for s_id in slices_by_series:
+        # WE NEED AT LEAST 8 SLICES !
+        if len(slices_by_series[s_id]) < 8:
+            continue
         best_slices, best_slices_overall, best_8slices = get_best_slice_selection(config, slices_by_series[s_id], topk=3)
         best_slices_per_series[s_id] = {
             "best_by_level": best_slices, 
@@ -670,15 +673,18 @@ def predict_lumbar(df_description: pd.DataFrame, config: dict, study_id: int) ->
     try:
         series_ids = df_description[(df_description['study_id'] == study_id)
                                 & (df_description['series_description'] == config['description'])]['series_id'].to_list()
-        
+
         best_slices_by_level, best_slices_overall, slices8_by_level = get_slices_to_use(study_id, series_ids, config)
         slices_to_use = dict(
             best_by_level=best_slices_by_level,
             best_overall=best_slices_overall,
             best_8_by_level=slices8_by_level,
         )
+
         positions_by_level = get_position_by_level(slices_to_use, config)
+
         crops_by_level = get_8crops_by_level(slices_to_use, positions_by_level, config)
+
         crops_for_classification = compute_best3_by_level(crops_by_level, config)
 
         classification_results = get_classification(crops_for_classification, config)
@@ -720,8 +726,9 @@ def compute_pipeline(input_images_folder, description_file, nb_studies_id=None):
         for config in tasks_metadatas:
             _predictions = predict_lumbar(df_description, config, study_id)
             final_predictions.extend(_predictions)
+
     return pd.DataFrame(final_predictions)
 
 if __name__ == "__main__":
-    df = compute_pipeline("train_images/", "train_series_descriptions.csv", 10)
+    df = compute_pipeline("train_images/", "train_series_descriptions.csv", 190)
     df.to_csv("pipeline_preds.csv", index=False)

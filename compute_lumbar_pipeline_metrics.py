@@ -23,23 +23,23 @@ def compute_scores(conf_matrix):
 
 if __name__ == "__main__":
     
-    description_file = "../REFAIT/train_series_descriptions.csv"
-    input_images_folder = "../REFAIT/train_images/"
+    description_file = "train_series_descriptions.csv"
+    input_images_folder = "train_images/"
 
     #predictions: pd.DataFrame = compute_pipeline(input_images_folder, description_file, nb_studies_id=190)
     #predictions.to_csv("predictions_pipeline.csv", index=False)
 
-    predictions = pd.read_csv("spinal_preds.csv")
+    predictions = pd.read_csv("pipeline_preds.csv")
     
-    labels = pd.read_csv("../REFAIT/train.csv")
+    labels = pd.read_csv("train.csv")
     LABELS = {"Normal/Mild" : 0, "Moderate": 1, "Severe": 2}
 
     column_names = [
         #"spinal_canal_stenosis",
         #"left_neural_foraminal_narrowing",
-        "right_neural_foraminal_narrowing",
+        #"right_neural_foraminal_narrowing",
         #"left_subarticular_stenosis",
-        #"right_subarticular_stenosis"
+        "right_subarticular_stenosis"
     ]
 
     matrixes = np.zeros((5, 3, 3))
