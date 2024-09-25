@@ -11,8 +11,7 @@ import pickle
 import pathlib
 import shutil
 
-from models import SagittalSliceSelecterModel
-from convert_to_ts import convert_to_ts
+from models import SliceSelecterModel
 
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
@@ -204,7 +203,7 @@ def train_model(input_dir, condition, description, model_name, scores_fct):
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
-    model = SagittalSliceSelecterModel()
+    model = SliceSelecterModel()
     model = model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
@@ -212,7 +211,7 @@ def train_model(input_dir, condition, description, model_name, scores_fct):
 
     best_metrics = None
     best = -1
-    for epoch in range(20):
+    for epoch in range(10):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, 16, device)
         loss_valid, instance_accuracy = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "valid_loss=", loss_valid, "instance_accuracy=", instance_accuracy)

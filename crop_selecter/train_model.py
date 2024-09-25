@@ -169,16 +169,17 @@ def get_best_slice_selection(model, pathes, topk):
     images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
     images = images.to(get_device())
     model = model.to(get_device())
-    preds_logits, preds_softmax = model(images.unsqueeze(0))
-    preds_softmax = preds_softmax.squeeze()
-    preds_overall = torch.sum(preds_softmax, dim=0)
+    with torch.no_grad():
+        preds_model = model(images.unsqueeze(0))
+    preds_model = preds_model.squeeze()
+    preds_overall = torch.sum(preds_model, dim=0)
 
     # get best by level
     slices_by_level = [
-        {"pathes": list(), "values": list()} for _ in range(preds_softmax.shape[0])
+        {"pathes": list(), "values": list()} for _ in range(preds_model.shape[0])
     ]
-    for level in range(preds_softmax.shape[0]):
-        pred_level = preds_softmax[level, :]
+    for level in range(preds_model.shape[0]):
+        pred_level = preds_model[level, :]
         values, max_indice = get_max_consecutive(pred_level, n=topk)
         slices_by_level[level]['pathes'] = [pathes[i] for i in max_indice]
         slices_by_level[level]['values'] = [v for v in values]
@@ -371,14 +372,14 @@ def train_crop_selecter(input_dir, slice_model_name, model_name, crop_descriptio
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     criterion = torch.nn.BCELoss().to(device)
-    best = 123456
-    for epoch in range(5):
+    best = -1
+    for epoch in range(10):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
-        if metrics['loss'] < best:
+        if metrics['accuracy_top3'] > best:
             print("New best model !", model_name)
-            best = metrics["loss"]
+            best = metrics["accuracy_top3"]
             torch.save(model.state_dict(), model_name)
             # scripted_model = torch.jit.script(model)
             # scripted_model.save(model_name)
@@ -397,33 +398,28 @@ def train_crop_selecter(input_dir, slice_model_name, model_name, crop_descriptio
     return best
 
 if __name__ == "__main__":
-    # train_crop_selecter(
-    #                 input_dir="../",
-    #                 slice_model_name="../trained_models/v6/model_slice_selection_st1_left_scripted.ts",
-    #                 model_name="model_crop_selection_st1_left.pth",
-    #                 crop_condition="Left Neural Foraminal Narrowing",
-    #                 crop_description="Sagittal T1",
-    #                 crop_size=(80, 120),
-    #                 image_resize=(640, 640),
-    #                 normalisation="clahe_norm_2"
-    # )
-    # train_crop_selecter(
-    #                 input_dir="../",
-    #                 slice_model_name="../trained_models/v6/model_slice_selection_st1_right_scripted.ts",
-    #                 model_name="model_crop_selection_st1_right.pth",
-    #                 crop_condition="Right Neural Foraminal Narrowing",
-    #                 crop_description="Sagittal T1",
-    #                 crop_size=(80, 120),
-    #                 image_resize=(640, 640),
-    #                 normalisation="clahe_norm_2"
-    # )
     train_crop_selecter(
                     input_dir="../",
-                    slice_model_name="../trained_models/v6/model_slice_selection_st2.ts",
-                    model_name="model_crop_selection_st2.pth",
-                    crop_condition="Spinal Canal Stenosis",
-                    crop_description="Sagittal T2/STIR",
-                    crop_size=(80, 120),
+                    slice_model_name="../slice_selection/slice_selector_ax_right.ts",
+                    model_name="model_crop_selection_ax_right.pth",
+                    crop_condition="Right Subarticular Stenosis",
+                    crop_description="Axial T2",
+                    crop_size=(184, 184),
                     image_resize=(640, 640),
                     normalisation="clahe_norm_2"
     )
+    train_crop_selecter(
+                    input_dir="../",
+                    slice_model_name="../slice_selection/slice_selector_ax_left.ts",
+                    model_name="model_crop_selection_ax_left.pth",
+                    crop_condition="Left Subarticular Stenosis",
+                    crop_description="Axial T2",
+                    crop_size=(184, 184),
+                    image_resize=(640, 640),
+                    normalisation="clahe_norm_2"
+    )
+
+    out_name = ["slice_selector_st1_left.ts", 
+                "slice_selector_st1_right.ts", 
+                "slice_selector_st2.ts", "slice_selector_ax_left.ts", "slice_selector_ax_right.ts"]
+

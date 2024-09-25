@@ -17,7 +17,7 @@ class ImageEncoder(nn.Module):
         features = torch.mean(x, dim = (2, 3))
         return features
 
-class SagittalSliceSelecterModel(nn.Module):
+class SliceSelecterModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.image_encoder = ImageEncoder()
