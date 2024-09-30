@@ -497,7 +497,7 @@ def get_tasks_metadatas():
             "slice_model_path": "trained_models/v6/slice_selector_st2.ts",
             "seg_model_path": "trained_models/v6/model_segmentation_st2.ts",
             "crops_model_path": "trained_models/v6/model_crop_selection_st2.pth",
-            "class_model_path": "trained_models/v6/classification_st2.pth",
+            "class_model_path": "trained_models/v7_only_classi/classification_st2.pth",
             
             # GENERAL
             "description": "Sagittal T2/STIR",
@@ -520,7 +520,7 @@ def get_tasks_metadatas():
 
             #   => classification
             "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
-            "class_crop_size": (64, 96),
+            "class_crop_size": (80, 120),
             "class_resize_image": (640, 640),
             "class_input_size": (128, 128),
         },
@@ -531,7 +531,7 @@ def get_tasks_metadatas():
             "slice_model_path": "trained_models/v6/slice_selector_st1_left.ts",
             "seg_model_path": "trained_models/v6/model_segmentation_st1_left.ts",
             "crops_model_path": "trained_models/v6/model_crop_selection_st1_left.pth",
-            "class_model_path": "trained_models/v6/classification_st1_left.pth",
+            "class_model_path": "trained_models/v7_only_classi/classification_st1_left.pth",
             
             # GENERAL
             "description": "Sagittal T1",
@@ -554,7 +554,7 @@ def get_tasks_metadatas():
 
             #   => classification
             "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
-            "class_crop_size": (64, 96),
+            "class_crop_size": (80, 120),
             "class_resize_image": (640, 640),
             "class_input_size": (128, 128),
         },
@@ -565,7 +565,7 @@ def get_tasks_metadatas():
             "slice_model_path": "trained_models/v6/slice_selector_st1_right.ts",
             "seg_model_path": "trained_models/v6/model_segmentation_st1_right.ts",
             "crops_model_path": "trained_models/v6/model_crop_selection_st1_right.pth",
-            "class_model_path": "trained_models/v6/classification_st1_right.pth",
+            "class_model_path": "trained_models/v7_only_classi/classification_st1_right.pth",
             
             # GENERAL
             "description": "Sagittal T1",
@@ -588,7 +588,7 @@ def get_tasks_metadatas():
 
             #   => classification
             "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
-            "class_crop_size": (64, 96),
+            "class_crop_size": (80, 120),
             "class_resize_image": (640, 640),
             "class_input_size": (128, 128),
         },
@@ -599,7 +599,7 @@ def get_tasks_metadatas():
             "slice_model_path": "trained_models/v6/slice_selector_ax_right.ts",
             "seg_model_path": "trained_models/v6/model_segmentation_ax_right.ts",
             "crops_model_path": "trained_models/v6/model_crop_selection_ax_right.pth",
-            "class_model_path": "trained_models/v6/classification_ax_right.pth",
+            "class_model_path": "trained_models/v7_only_classi/classification_ax_right.pth",
             
             # GENERAL
             "description": "Axial T2",
@@ -622,7 +622,7 @@ def get_tasks_metadatas():
 
             #   => classification
             "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
-            "class_crop_size": (184, 184),
+            "class_crop_size": (128, 128),
             "class_resize_image": (640, 640),
             "class_input_size": (128, 128),
         },
@@ -633,7 +633,7 @@ def get_tasks_metadatas():
             "slice_model_path": "trained_models/v6/slice_selector_ax_left.ts",
             "seg_model_path": "trained_models/v6/model_segmentation_ax_left.ts",
             "crops_model_path": "trained_models/v6/model_crop_selection_ax_left.pth",
-            "class_model_path": "trained_models/v6/classification_ax_left.pth",
+            "class_model_path": "trained_models/v7_only_classi/classification_ax_left.pth",
             
             # GENERAL
             "description": "Axial T2",
@@ -656,7 +656,7 @@ def get_tasks_metadatas():
 
             #   => classification
             "class_backbones": ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k'],
-            "class_crop_size": (184, 184),
+            "class_crop_size": (128, 128),
             "class_resize_image": (640, 640),
             "class_input_size": (128, 128),
         },

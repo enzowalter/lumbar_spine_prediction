@@ -19,10 +19,58 @@ from models_sagittal import LumbarSegmentationModelSagittal
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
 
-def generate_dataset(input_dir, condition, description):
+##########################################################
+#
+#   SLICES SELECTION INFERENCE
+#
+##########################################################
+
+def get_max_consecutive_N(preds, n):
+    max_sum = -float('inf')
+    max_idx = -1
+    
+    for i in range(len(preds) - n + 1):
+        current_sum = preds[i:i + n].sum().item()
+        if current_sum > max_sum:
+            max_sum = current_sum
+            max_idx = i
+    
+    max_consecutive_indices = list(range(max_idx, max_idx + n))
+    values = preds[max_consecutive_indices]
+    values = values.detach().cpu().numpy()
+    return values, max_consecutive_indices
+
+def get_best_slice_selection(input_size, device, slice_model, pathes):
+    nb_slices = len(pathes)
+    images = np.zeros((nb_slices, 1, *input_size))
+    for k, path in enumerate(pathes):
+        im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
+                                        input_size,
+                                        interpolation=cv2.INTER_LINEAR)
+
+        mean = im.mean()
+        std = im.std()
+        im = (im - mean) / std
+        images[k, 0, ...] = im
+
+    images = torch.tensor(images).expand(nb_slices, 3, *input_size).float()
+    with torch.no_grad():
+        preds_model = slice_model(images.to(device).unsqueeze(0))
+    preds_model = preds_model.squeeze()
+    preds_overall = torch.sum(preds_model, dim=0)
+
+    # get best 3 overall (=> best after sum of each level)
+    values, max_indices = get_max_consecutive_N(preds_overall, 3)
+    best_slices_overall = [pathes[i] for i in max_indices]
+    return best_slices_overall
+
+def generate_dataset(input_dir, condition, description, model_name):
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
     MASK_SIZE = (384, 384)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    slice_model = torch.jit.load(model_name)
+    slice_model = slice_model.eval().to(device)
 
     df_study_labels = pd.read_csv(f"{input_dir}/train.csv")
     df_study_coordinates = pd.read_csv(f"{input_dir}/train_label_coordinates.csv")
@@ -46,42 +94,25 @@ def generate_dataset(input_dir, condition, description):
                 dataset_item['study_id'] = study_id
                 dataset_item['series_id'] = s_id
                 dataset_item['all_slices_path'] = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
-                dataset_item['output_mask'] = np.zeros((len(LEVELS), *MASK_SIZE))
+                best_slices = get_best_slice_selection((224, 224), device, slice_model, dataset_item['all_slices_path'])
+                dataset_item['best_slices'] = best_slices
+                dataset_item['output_mask'] = np.zeros((5, 384, 384))
+
                 dataset_item['gt_positions'] = [[None, None]] * len(LEVELS)
-
+                coordinates = np.zeros((5, 2))
                 for coordinate in coordinates_dict:
-                    # get 3 slices from l3 l4
-                    if coordinate['level'] == 'L3/L4':
-                        dataset_item['slices_path'] = list()
-                        for idx, sp in enumerate(dataset_item['all_slices_path']):
-                            if get_instance(sp) == coordinate['instance_number']:
-                                if idx == 0:
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx])        
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx + 1])        
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx + 2])
-                                elif idx == len(dataset_item['all_slices_path']) - 1:
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx - 2])        
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx - 1])        
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx])
-                                else:
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx - 1])        
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx])        
-                                    dataset_item['slices_path'].append(dataset_item['all_slices_path'][idx + 1])
-
-                                break
-
                     idx_level = LEVELS[coordinate['level']]
                     instance = coordinate['instance_number']
                     x, y = coordinate['x'], coordinate['y']
-
                     original_slice = f"{input_dir}/train_images/{study_id}/{s_id}/{instance}.dcm"
                     original_shape = pydicom.dcmread(original_slice).pixel_array.shape
-
                     x = int((x / original_shape[1]) * MASK_SIZE[1])
                     y = int((y /original_shape[0]) * MASK_SIZE[0])
+                    coordinates[idx_level, 0] = x
+                    coordinates[idx_level, 1] = y
                     dataset_item['gt_positions'][idx_level] = [x, y]
-                    dataset_item['output_mask'][idx_level][y-21:y+21,x-21:x+21] = 1
-
+                    dataset_item['output_mask'][idx_level][y-17:y+17,x-17:x+17] = 1
+        
                 dataset.append(dataset_item)
     return dataset
 
@@ -95,14 +126,17 @@ class SegmentationDataset(Dataset):
     def __getitem__(self, idx):
         data = self.datas[idx]
 
-        slices_path = data['slices_path']
+        slices_path = data['best_slices']
         nb_slices = len(slices_path)
         images = np.zeros((nb_slices, 384, 384))
         for k, path in enumerate(slices_path):
             im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
                                            (384, 384),
                                            interpolation=cv2.INTER_LINEAR)
-            im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+            # z score
+            mean = im.mean()
+            std = im.std()
+            im = (im - mean) / std
             images[k, ...] = im
         images = torch.tensor(images).float()
         return images, torch.tensor(data['output_mask']).float(), torch.tensor(data['gt_positions'])
@@ -204,10 +238,10 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
     return epoch_loss
 
-def train_model_sagittal(input_dir, condition, description, model_name):
+def train_model_sagittal(input_dir, condition, description, out_name, slice_name):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = generate_dataset(input_dir, condition, description)
+    dataset = generate_dataset(input_dir, condition, description, slice_name)
     nb_valid = int(len(dataset) * 0.1)
     train_dataset = SegmentationDataset(dataset[nb_valid:])
     valid_dataset = SegmentationDataset(dataset[:nb_valid])
@@ -227,41 +261,43 @@ def train_model_sagittal(input_dir, condition, description, model_name):
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['mean_d'] < best:
-            print("New best model !", model_name)
+            print("New best model !", out_name)
             best = metrics["mean_d"]
             best_metrics = metrics
             scripted_model = torch.jit.script(model)
-            scripted_model.save(model_name)
+            scripted_model.save(out_name)
 
         scheduler.step()
         print(scheduler.get_last_lr())
         print("-" * 55)
-    
-    print("-" * 55)
-    print("-" * 55)
-    print("DONE !")
-    print("Model saved:", model_name)
-    print("Best metrics:", best_metrics)
-    print("-" * 55)
-    print("-" * 55)
+
     return best_metrics
 
 if __name__ == "__main__":
-    train_model_sagittal(
-                "../",
-                "Left Neural Foraminal Narrowing",
-                "Sagittal T1",
-                "model_segmentation_st1_left.ts",
-            )
-    train_model_sagittal(
-                "../",
-                "Right Neural Foraminal Narrowing",
-                "Sagittal T1",
-                "model_segmentation_st1_right.ts",
-            )
-    train_model_sagittal(
-                "../",
-                "Spinal Canal Stenosis",
-                "Sagittal T2/STIR",
-                "model_segmentation_st2.ts",
-            )
+
+
+    conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis"]
+    descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR"]
+    out_name = ["segmentation_st1_left.ts", "segmentation_st1_right.ts", "segmentation_st2.ts"]
+    slice_path = '../trained_models/v9/'
+    slice_models = [f"{slice_path}/slice_selector_st1_left.ts", f"{slice_path}/slice_selector_st1_right.ts", f"{slice_path}/slice_selector_st2.ts"]
+    metrics = dict()
+
+    for cond, desc, out, slice_name in zip(conditions, descriptions, out_name, slice_models):
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        print("Training:", cond)
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        best = train_model_sagittal(
+            input_dir="../",
+            out_name=out,
+            condition=cond,
+            description=desc,
+            slice_name=slice_name,
+        )
+        metrics[cond] = best
+    print("Done !")
+    print(metrics)

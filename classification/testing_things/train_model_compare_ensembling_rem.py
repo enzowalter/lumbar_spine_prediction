@@ -189,8 +189,40 @@ def validate(model, loader, criterion, device):
     with torch.no_grad():
         for images, labels_gt in tqdm.tqdm(loader, desc="Valid"):
             labels_gt = labels_gt.to(device).long()
-            final_output = model(images.to(device))
+            final_output = model(images.to(device), mode="inference")
             
+            all_predictions.append(final_output.cpu())
+            all_labels.append(labels_gt.cpu())
+            
+            loss = criterion(final_output, labels_gt)
+            classification_loss_sum += loss.item()
+
+    all_predictions = torch.cat(all_predictions, dim=0).to(device)
+    all_labels = torch.cat(all_labels, dim=0).to(device)
+    
+    concat_loss = criterion(all_predictions, all_labels).item()
+    avg_classification_loss = classification_loss_sum / len(loader)
+    return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
+
+def validate_models(models, loader, criterion, device):
+    for model in models:
+        model.eval()
+
+    classification_loss_sum = 0
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+        for images, labels_gt in tqdm.tqdm(loader, desc="Valid"):
+            labels_gt = labels_gt.to(device).long()
+
+            final_output = list()
+            for model in models:
+                final_output.append(model(images.to(device)))
+
+            final_output = torch.stack(final_output, dim = 1)
+            final_output = torch.mean(final_output, dim = 1)
+
             all_predictions.append(final_output.cpu())
             all_labels.append(labels_gt.cpu())
             
@@ -212,7 +244,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
         images = images.to(device)
         labels = labels.to(device).long()
 
-        predictions = model(images.to(device))
+        predictions = model(images.to(device), mode='train')
 
         loss = criterion(predictions, labels)
         loss.backward()
@@ -233,7 +265,12 @@ def train_submodel_test_encoder(input_dir, model_name, crop_description, crop_co
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
     # get model
-    model = SimpleClassifier(encoder_name)
+    # model = SimpleClassifier(encoder_name)
+    model = REM(
+        n_classes=3,
+        n_fold_classifier=3,
+        backbones=['focalnet_base_lrf.ms_in1k', 'densenet121.ra_in1k', 'convnext_base.fb_in1k', 'darknet53.c2ns_in1k', 'hgnetv2_b1.ssld_stage2_ft_in1k']
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -243,40 +280,50 @@ def train_submodel_test_encoder(input_dir, model_name, crop_description, crop_co
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=5, gamma=0.5)
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device))
     best = 123456
-    for epoch in range(6):
+    for epoch in range(20):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
             print("New best model !", model_name)
             best = metrics["concat_loss"]
+            n_model = REM_Script(
+                    n_classes=3,
+                    n_fold_classifier=3,
+                    backbones=['focalnet_base_lrf.ms_in1k', 'densenet121.ra_in1k', 'convnext_base.fb_in1k', 'darknet53.c2ns_in1k', 'hgnetv2_b1.ssld_stage2_ft_in1k']
+                )
+            n_model.load_state_dict(model.state_dict())
+            scripted_model = torch.jit.script(n_model)
+            scripted_model.save(model_name)
+
         scheduler.step()
     return best
 
 if __name__ == "__main__":
         
+    # Ensembling
     encoders = [
-        # 'focalnet_base_lrf.ms_in1k', 0.5247368812561035 x
-        # 'densenet121.ra_in1k', 0.5281888246536255 x
+        'focalnet_base_lrf.ms_in1k', # 0.5247368812561035
+        'densenet121.ra_in1k', # 0.5281888246536255
         # 'convnextv2_base.fcmae_ft_in1k', 0.9270282983779907
-        # 'convnext_base.fb_in1k', 0.5202980637550354 x
+        'convnext_base.fb_in1k', # 0.5202980637550354
         # 'cs3darknet_l.c2ns_in1k', 0.5652085542678833
         # 'cspresnet50.ra_in1k', 0.5684816241264343
-        # 'darknet53.c2ns_in1k', 0.5463195443153381 x
+        'darknet53.c2ns_in1k', # 0.5463195443153381
         # 'dla60.in1k', 0.5571991205215454
         # 'gc_efficientnetv2_rw_t.agc_in1k', 0.5591642260551453
-        # 'hgnetv2_b1.ssld_stage2_ft_in1k', 0.5294161438941956 x
+        'hgnetv2_b1.ssld_stage2_ft_in1k', # 0.5294161438941956
         # 'inception_next_base.sail_in1k', 0.5858572125434875
         # 'mobilenetv1_100.ra4_e3600_r224_in1k', 0.5529153943061829
         # 'pit_b_distilled_224.in1k', fail
-        # 'selecsls42b.in1k', 0.549743115901947        
+        # 'selecsls42b.in1k', 0.549743115901947
     ]
     metrics = dict()
-    for encoder in encoders:
-        print("Testing:", encoder)
+    for k, encoder in enumerate(encoders):
+        print("Training:", encoder)
         best_logloss = train_submodel_test_encoder(
                         input_dir="../../",
-                        model_name="classification_left_neural_foraminal_narrowing",
+                        model_name=f"ensemble_{k}.ts",
                         crop_condition="Left Neural Foraminal Narrowing",
                         label_condition="Left Neural Foraminal Narrowing",
                         crop_description="Sagittal T1",
@@ -284,7 +331,25 @@ if __name__ == "__main__":
                         image_resize=(640, 640),
                         encoder_name=encoder,
         )
-
         metrics[encoder] = best_logloss
-    
     print(metrics)
+
+    # GET RESULTS
+    dataset = generate_dataset("../../", "Sagittal T1", "Left Neural Foraminal Narrowing", "Left Neural Foraminal Narrowing", (80, 120), (640, 640))
+    nb_valid = int(len(dataset) * 0.1)
+    train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True)
+    valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    valid_loader = DataLoader(valid_dataset, batch_size=1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    models = list()
+    for k, encoder in enumerate(encoders):
+        m = torch.jit.load(f"ensemble_{k}.ts")
+        m = m.to(device)
+        m = m.eval()
+        models.append(m)
+
+    metrics = validate_models(models, valid_loader, torch.nn.CrossEntropyLoss(weight = torch.tensor([1/7, 2/7, 4/7]).to(device)), device)
+
+    print("Ensembling metrics=", metrics)

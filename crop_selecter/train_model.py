@@ -99,34 +99,13 @@ def laplacian_filter(image):
     laplacian = cv2.Laplacian(image, cv2.CV_64F)
     return laplacian
 
-def cut_crops(slices_path, x, y, crop_size, image_resize, normalisation):
+def cut_crops(slices_path, x, y, crop_size, image_resize):
     output_crops = np.zeros((len(slices_path), 128, 128))
     for k, slice_path in enumerate(slices_path):
         pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
-        if normalisation == "min_max_slice":
-            pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min() + 1e-9)
-        
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
         crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
-        if normalisation == "min_max_crop":
-            crop = (crop - crop.min()) / (crop.max() - crop.min() + 1e-9)
-        elif normalisation == "laplacian":
-            crop = laplacian_filter(crop)
-        elif normalisation == "laplacian_norm":
-            crop = laplacian_norm_filter(crop)
-        elif normalisation == "laplacian_norm_2":
-            crop = laplacian_norm_filter2(crop)
-        elif normalisation == "clahe":
-            crop = clahe_equalization(crop)
-        elif normalisation == "clahe_norm":
-            crop = clahe_equalization_norm(crop)
-        elif normalisation == "clahe_norm_2":
-            crop = clahe_equalization_norm2(crop)
-        elif normalisation == "clahe_norm_gpt":
-            crop = compute_dahe(crop)
-        elif normalisation == "zscore":
-            crop = z_score_normalization(crop)
-
+        crop = clahe_equalization_norm2(crop)
         crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_LINEAR)
         output_crops[k, ...] = crop
     return output_crops
@@ -152,55 +131,55 @@ def get_max_consecutive(preds, n):
     values = values.detach().cpu().numpy()
     return values, max_consecutive_indices
 
-def get_best_slice_selection(model, pathes, topk):
-    """
-    Return best slices for each level.
-    Slice are not sorted by instance_number, they are sorted by topk
-    """
+def get_max_consecutive_N(preds, n):
+    max_sum = -float('inf')
+    max_idx = -1
+    
+    for i in range(len(preds) - n + 1):
+        current_sum = preds[i:i + n].sum().item()
+        if current_sum > max_sum:
+            max_sum = current_sum
+            max_idx = i
+    
+    max_consecutive_indices = list(range(max_idx, max_idx + n))
+    values = preds[max_consecutive_indices]
+    values = values.detach().cpu().numpy()
+    return values, max_consecutive_indices
 
+def get_best_slice_selection(input_size, device, slice_model, pathes):
     nb_slices = len(pathes)
-    images = np.zeros((nb_slices, 1, 224, 224))
+    images = np.zeros((nb_slices, 1, *input_size))
     for k, path in enumerate(pathes):
         im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
-                                        (224, 224),
+                                        input_size,
                                         interpolation=cv2.INTER_LINEAR)
-        im = (im - im.min()) / (im.max() - im.min() + 1e-9)
+        mean = im.mean()
+        std = im.std()
+        im = (im - mean) / std
         images[k, 0, ...] = im
-    images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
-    images = images.to(get_device())
-    model = model.to(get_device())
-    with torch.no_grad():
-        preds_model = model(images.unsqueeze(0))
-    preds_model = preds_model.squeeze()
-    preds_overall = torch.sum(preds_model, dim=0)
 
-    # get best by level
-    slices_by_level = [
-        {"pathes": list(), "values": list()} for _ in range(preds_model.shape[0])
-    ]
+    images = torch.tensor(images).expand(nb_slices, 3, *input_size).float()
+    with torch.no_grad():
+        preds_model = slice_model(images.to(device).unsqueeze(0))
+    preds_model = preds_model.squeeze()
+    slices_by_level = [list() for _ in range(5)]
     for level in range(preds_model.shape[0]):
         pred_level = preds_model[level, :]
-        values, max_indice = get_max_consecutive(pred_level, n=topk)
-        slices_by_level[level]['pathes'] = [pathes[i] for i in max_indice]
-        slices_by_level[level]['values'] = [v for v in values]
-
-    # get best overall (=> best after sum of each level)
-    values, max_indices = get_max_consecutive(preds_overall, n=topk)
-    best_slices_overall = dict()
-    best_slices_overall['pathes'] = [pathes[i] for i in max_indices]
-    best_slices_overall['values'] = [v for v in values]
-
-    return slices_by_level, best_slices_overall
+        _, max_indice = get_max_consecutive_N(pred_level, 8)
+        slices_by_level[level] = [pathes[i] for i in max_indice]
+    return slices_by_level
 
 def generate_scores(num_images, index):
     scores = np.zeros(num_images)
-    for i in range(num_images):
-        distance = abs(i - index)
-        score = max(0, 1 - (distance ** 2) * 0.1)
-        scores[i] = score
+    scores[index] = 1
+    if index - 1 >= 0:
+        scores[index - 1] = 0.5
+    if index + 1 <= num_images - 1:
+        scores[index + 1] = 0.5
     return scores
 
 def generate_dataset(input_dir, model_selection, crop_description, crop_condition, crop_size, image_resize):
+
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
     df_study_labels = pd.read_csv(f"{input_dir}/train.csv")
     df_study_coordinates = pd.read_csv(f"{input_dir}/train_label_coordinates.csv")
@@ -223,12 +202,13 @@ def generate_dataset(input_dir, model_selection, crop_description, crop_conditio
                 if len(all_slices_path) < 10:
                     print("No enought slices !")
                     continue
-                slices_by_level, _ = get_best_slice_selection(model_selection, all_slices_path, topk=8)
+
+                slices_by_level = get_best_slice_selection((224, 224), get_device(), model_selection, all_slices_path)
 
                 for coordinate in coordinates_dict:
                     level = coordinate['level']
                     idx_level = LEVELS[level]
-                    slices_to_use = slices_by_level[idx_level]["pathes"]
+                    slices_to_use = slices_by_level[idx_level]
                     gt_instance = coordinate["instance_number"]
 
                     has_instance = False
@@ -262,10 +242,9 @@ def generate_dataset(input_dir, model_selection, crop_description, crop_conditio
 ############################################################
 
 class CropClassifierDataset(Dataset):
-    def __init__(self, infos, normalisation, is_train=False):
+    def __init__(self, infos, is_train=False):
         self.datas = infos
         self.is_train = is_train
-        self.normalisation = normalisation
 
     def __len__(self):
         return len(self.datas)
@@ -279,10 +258,11 @@ class CropClassifierDataset(Dataset):
         crop_size = data['crop_size']
         image_resize = data['image_resize']
 
-        x += random.randint(-5, 6)
-        y += random.randint(-5, 6)
+        if self.is_train:
+            x += random.randint(-8, 8)
+            y += random.randint(-8, 8)
 
-        crops = cut_crops(all_slices_path, x, y, crop_size, image_resize, self.normalisation)
+        crops = cut_crops(all_slices_path, x, y, crop_size, image_resize)
 
         gt_index = None
         for k, s in enumerate(all_slices_path):
@@ -311,7 +291,7 @@ def validate(model, loader, criterion, device):
     with torch.no_grad():
         for images, labels_gt, gt_index in tqdm.tqdm(loader, desc="Valid"):
             labels_gt = labels_gt.to(device)
-            final_output = model(images.to(device))
+            final_output = model(images.to(device), mode="inference")
             loss = criterion(final_output, labels_gt)
 
             _, indice = torch.max(final_output, dim=1)
@@ -344,14 +324,14 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch):
         images = images.to(device)
         labels = labels.to(device)
 
-        predictions = model(images.to(device))
+        predictions = model(images.to(device), mode="train")
         loss = criterion(predictions, labels)
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item() / len(loader)
     return epoch_loss
 
-def train_crop_selecter(input_dir, slice_model_name, model_name, crop_description, crop_condition, crop_size, image_resize, normalisation):
+def train_crop_selecter(input_dir, slice_model_name, model_name, crop_description, crop_condition, crop_size, image_resize):
 
     # get model
     model = torch.jit.load(slice_model_name)
@@ -361,28 +341,30 @@ def train_crop_selecter(input_dir, slice_model_name, model_name, crop_descriptio
     # get dataset
     dataset = generate_dataset(input_dir, model, crop_description, crop_condition, crop_size, image_resize)
     nb_valid = int(len(dataset) * 0.1)
-    train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True, normalisation=normalisation)
-    valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False, normalisation=normalisation)
+    train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True)
+    valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False)
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1)
 
-    model = CropSelecter()
+    model = REM_CropSelecterModel()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     criterion = torch.nn.BCELoss().to(device)
     best = -1
-    for epoch in range(10):
+    for epoch in range(15):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['accuracy_top3'] > best:
             print("New best model !", model_name)
             best = metrics["accuracy_top3"]
-            torch.save(model.state_dict(), model_name)
-            # scripted_model = torch.jit.script(model)
-            # scripted_model.save(model_name)
+            scripted_model = REM_CropSelecterModel_Scripted()
+            scripted_model.load_state_dict(model.state_dict())
+            scripted_model = torch.jit.script(scripted_model)
+            scripted_model.save(model_name)
+        
         print('-' * 50)
 
     print('-' * 50)
@@ -398,28 +380,40 @@ def train_crop_selecter(input_dir, slice_model_name, model_name, crop_descriptio
     return best
 
 if __name__ == "__main__":
-    train_crop_selecter(
-                    input_dir="../",
-                    slice_model_name="../slice_selection/slice_selector_ax_right.ts",
-                    model_name="model_crop_selection_ax_right.pth",
-                    crop_condition="Right Subarticular Stenosis",
-                    crop_description="Axial T2",
-                    crop_size=(184, 184),
-                    image_resize=(640, 640),
-                    normalisation="clahe_norm_2"
-    )
-    train_crop_selecter(
-                    input_dir="../",
-                    slice_model_name="../slice_selection/slice_selector_ax_left.ts",
-                    model_name="model_crop_selection_ax_left.pth",
-                    crop_condition="Left Subarticular Stenosis",
-                    crop_description="Axial T2",
-                    crop_size=(184, 184),
-                    image_resize=(640, 640),
-                    normalisation="clahe_norm_2"
-    )
 
-    out_name = ["slice_selector_st1_left.ts", 
-                "slice_selector_st1_right.ts", 
-                "slice_selector_st2.ts", "slice_selector_ax_left.ts", "slice_selector_ax_right.ts"]
 
+    # conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis"]
+    # descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR"]
+    # out_name = ["crop_selection_st1_left.ts", "crop_selection_st1_right.ts", "crop_selection_st2.ts"]
+    # slice_path = '../trained_models/v9/'
+    # slice_models = [f"{slice_path}/slice_selector_st1_left.ts", f"{slice_path}/slice_selector_st1_right.ts", f"{slice_path}/slice_selector_st2.ts"]
+    # metrics = dict()
+
+    conditions = ["Left Subarticular Stenosis", "Right Subarticular Stenosis"]
+    descriptions = ["Axial T2", "Axial T2"]
+    out_name = ["crop_selection_ax_left.ts", "crop_selection_ax_right.ts"]
+    slice_path = '../trained_models/v9/'
+    slice_models = [f"{slice_path}/slice_selector_ax_left.ts", f"{slice_path}/slice_selector_ax_right.ts"]
+    metrics = dict()
+
+    for cond, desc, out, slice_name in zip(conditions, descriptions, out_name, slice_models):
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        print("Training:", cond)
+        print('-' * 50)
+        print('-' * 50)
+        print('-' * 50)
+        best = train_crop_selecter(
+                        input_dir="../",
+                        slice_model_name=slice_name,
+                        model_name=out,
+                        crop_condition=cond,
+                        crop_description=desc,
+                        crop_size=(128, 128),
+                        image_resize=(640, 640),
+        )
+
+        metrics[cond] = best
+    print("Done !")
+    print(metrics)

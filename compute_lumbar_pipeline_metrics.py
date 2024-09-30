@@ -39,7 +39,7 @@ if __name__ == "__main__":
         #"left_neural_foraminal_narrowing",
         #"right_neural_foraminal_narrowing",
         #"left_subarticular_stenosis",
-        "right_subarticular_stenosis"
+        #"right_subarticular_stenosis"
     ]
 
     matrixes = np.zeros((5, 3, 3))

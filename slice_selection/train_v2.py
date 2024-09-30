@@ -10,6 +10,10 @@ import torch
 import pickle
 import pathlib
 import shutil
+import torchvision.transforms as T
+from scipy.ndimage import gaussian_filter, affine_transform, map_coordinates
+import random
+import concurrent.futures
 
 from models import *
 
@@ -30,15 +34,41 @@ def generate_scores(num_images, index):
     scores[index] = 1
     return create_soft_labels(scores)
 
-def generate_dataset(input_dir, condition, description, scores_fct):
+import pydicom
+import numpy as np
+from scipy.ndimage import zoom
+import cv2
 
-    # Reset tmp folder
-    output_folder = "_tmp_"
-    # try:
-    #     shutil.rmtree(output_folder)
-    # except:
-    #     pass
-    # pathlib.Path(output_folder).mkdir(exist_ok=True, parents=True)
+def load_dicom_series(dicom_files):
+    dicom_files = sorted(dicom_files, key = lambda x : get_instance(x))
+    slices = [pydicom.dcmread(f) for f in dicom_files]
+    images = np.stack([s.pixel_array for s in slices], axis=-1)  # shape: [height, width, num_slices]
+    return images
+
+def resample_volume(volume, slice_thickness, pixel_spacing, new_spacing=[1.0, 1.0, 1.0]):
+    current_spacing = [slice_thickness] + pixel_spacing
+    resize_factor = np.array(current_spacing) / np.array(new_spacing)
+    resampled_volume = zoom(volume, resize_factor, mode='nearest')
+    return resampled_volume
+
+def resize_slices_to_224(volume):
+    num_slices = volume.shape[-1]
+    resized_slices = []
+    for i in range(num_slices):
+        slice_ = volume[:, :, i]
+        resized_slice = cv2.resize(slice_, (224, 224), interpolation=cv2.INTER_LINEAR)
+        resized_slices.append(resized_slice)
+    resized_volume = np.stack(resized_slices, axis=-1)
+    return resized_volume
+
+def z_score_normalize_all_slices(scan):
+    scan_flattened = scan.flatten()
+    mean = np.mean(scan_flattened)
+    std = np.std(scan_flattened)
+    z_normalized_scan = (scan - mean) / std
+    return z_normalized_scan
+
+def generate_dataset(input_dir, condition, description, scores_fct):
 
     LEVELS = {"L1/L2":0, "L2/L3":1, "L3/L4":2, "L4/L5":3, "L5/S1":4}
 
@@ -65,28 +95,9 @@ def generate_dataset(input_dir, condition, description, scores_fct):
                 dataset_item['series_id'] = s_id
                 dataset_item['slices_path'] = sorted(glob.glob(f"{input_dir}/train_images/{study_id}/{s_id}/*.dcm"), key = lambda x : get_instance(x))
 
-                if len(dataset_item['slices_path']) > 50:
-                    continue # gpu explodes
-                
                 dataset_item['nb_slices'] = len(dataset_item['slices_path'])
                 dataset_item['labels'] = np.zeros((len(LEVELS), len(dataset_item['slices_path'])))
                 dataset_item['gt_indices'] = np.zeros(len(LEVELS))
-
-                # Preprocess images
-                # images_preprocessed = np.zeros((len(dataset_item['slices_path']), 1, 224, 224))
-                # for k, path in enumerate(dataset_item['slices_path']):
-                #     im = cv2.resize(pydicom.dcmread(path).pixel_array.astype(np.float32), 
-                #                                 (224, 224),
-                #                                 interpolation=cv2.INTER_LINEAR)
-                #     # z score
-                #     mean = im.mean()
-                #     std = im.std()
-                #     im = (im - mean) / std
-                #     images_preprocessed[k, 0, ...] = im
-
-                preprocess_name = f"{output_folder}/{study_id}_{s_id}.npy"
-                # np.save(preprocess_name, images_preprocessed)
-                dataset_item["preprocess_name"] = preprocess_name
 
                 # Fill GT
                 for coordinate in coordinates_dict:
@@ -106,8 +117,9 @@ def generate_dataset(input_dir, condition, description, scores_fct):
     return dataset
 
 class SlicePredicterDataset(Dataset):
-    def __init__(self, infos):
+    def __init__(self, infos, is_train=False):
         self.datas = infos
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.datas)
@@ -115,20 +127,15 @@ class SlicePredicterDataset(Dataset):
     def __getitem__(self, idx):
         data = self.datas[idx]
         labels = data['labels']
-        nb_slices = data['nb_slices']
-        images = np.load(data['preprocess_name'])
+        slices = data['slices_path']
+        volume = load_dicom_series(slices)
+        resized_volume = resize_slices_to_224(volume)
+        normalised_volume = z_score_normalize_all_slices(resized_volume)
 
-        images = torch.tensor(images).expand(nb_slices, 3, 224, 224).float()
+        normalised_volume = normalised_volume.transpose(2, 0, 1)
+        images = torch.tensor(normalised_volume).unsqueeze(1).float()
         labels = torch.tensor(labels).float()
-        return images, labels, np.array(data['gt_indices'])  
-
-def custom_collate(batch):
-    images, labels, gt_indices = zip(*batch)
-
-    images_nested = torch.nested.nested_tensor(list(images))
-    labels_nested = torch.nested.nested_tensor(list(labels))
-    gt_indices_stacked = torch.stack([torch.tensor(idx) for idx in gt_indices])
-    return images_nested, labels_nested, gt_indices_stacked
+        return images, labels, np.array(data['gt_indices'])
 
 def get_max_consecutive(preds, gt_indice, n):
     max_sum = -float('inf')
@@ -199,60 +206,63 @@ def train_epoch(model, loader, criterion, optimizer, accumulation_step, device):
 
     return epoch_loss
 
-def train_model(input_dir, condition, description, model_name, scores_fct):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.bce_loss = torch.nn.BCELoss(reduction='none')
+
+    def forward(self, inputs, targets):
+        bce_loss = self.bce_loss(inputs, targets)
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return torch.mean(focal_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(focal_loss)
+        else:
+            return focal_loss
+
+def train_model(input_dir, condition, description, scores_fct, step):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = generate_dataset(input_dir, condition, description, scores_fct)
 
-    nb_valid = int(len(dataset) * 0.1)
-    train_dataset = SlicePredicterDataset(dataset[nb_valid:])
-    valid_dataset = SlicePredicterDataset(dataset[:nb_valid])
+    # select validation and training set
+    nb_valid = len(dataset) // 4
+    valid_indices = list(range(step * nb_valid, (step + 1) * nb_valid))
+    all_indices = list(range(len(dataset)))
+    train_indices = list(set(all_indices) - set(valid_indices))
+    
+    train_dataset = SlicePredicterDataset([dataset[i] for i in train_indices], is_train=True)
+    valid_dataset = SlicePredicterDataset([dataset[i] for i in valid_indices])
 
     # batch size = 1 because no padding on sequences
-    train_loader = DataLoader(train_dataset, batch_size=1)
-    #train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=4)
-    valid_loader = DataLoader(valid_dataset, batch_size=1)
+    train_loader = DataLoader(train_dataset, batch_size=1, num_workers=3, pin_memory=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=3)
 
-    model = SliceSelecterModelDistinctClassifier()
+    model = SliceSelecterModelTransformer()
     model = model.to(device)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
-
-
-    class FocalLoss(nn.Module):
-        def __init__(self, alpha=1, gamma=2, reduction='mean'):
-            super(FocalLoss, self).__init__()
-            self.alpha = alpha
-            self.gamma = gamma
-            self.reduction = reduction
-            self.bce_loss = torch.nn.BCELoss(reduction='none')
-
-        def forward(self, inputs, targets):
-            bce_loss = self.bce_loss(inputs, targets)
-            pt = torch.exp(-bce_loss)
-            focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
-
-            if self.reduction == 'mean':
-                return torch.mean(focal_loss)
-            elif self.reduction == 'sum':
-                return torch.sum(focal_loss)
-            else:
-                return focal_loss
-
     criterion = FocalLoss(alpha=1, gamma=2)
 
     best_metrics = None
+
+    current_name = f"trained_models/{condition.lower().replace(' ', '_')}_step_{step}.pth"
+
     best = -1
-    for epoch in range(20):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, 4, device)
+    for epoch in range(10):
+        loss_train = train_epoch(model, train_loader, criterion, optimizer, 8, device)
         loss_valid, instance_accuracy = validate(model, valid_loader, criterion, device)
-        print("Epoch", epoch, "train_loss=", loss_train, "valid_loss=", loss_valid, "instance_accuracy=", instance_accuracy)
+        print("Epoch", epoch, "step", step, "train_loss=", loss_train, "valid_loss=", loss_valid, "instance_accuracy=", instance_accuracy)
         if instance_accuracy[3] > best:
-            print("New best model !", model_name)
+            print("New best model !")
             best = instance_accuracy[3]
             best_metrics = instance_accuracy
-            scripted_model = torch.jit.script(model)
-            scripted_model.save(model_name)
+            torch.save(model.state_dict(), current_name)
         print("-" * 55)
 
     return best_metrics
@@ -261,29 +271,36 @@ if __name__ == "__main__":
 
     conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis", "Left Subarticular Stenosis", "Right Subarticular Stenosis"]
     descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR", "Axial T2", "Axial T2"]
-    out_name = ["slice_selector_st1_left.ts", "slice_selector_st1_right.ts", "slice_selector_st2.ts", "slice_selector_ax_left.ts", "slice_selector_ax_right.ts"]
+    out_name = ["slice_selector_st1_left_bs16.ts", "slice_selector_st1_right_bs16.ts", "slice_selector_st2_bs16.ts", "slice_selector_ax_left_bs16.ts", "slice_selector_ax_right_bs16.ts"]
     scores_fct = [generate_scores, generate_scores, generate_scores, generate_scores, generate_scores]
+
     metrics = dict()
-
-    for cond, desc, out, fct in zip(conditions, descriptions, out_name, scores_fct):
-
+    def train_and_collect_metrics(cond, desc, fct, step):
         print('-' * 50)
-        print('-' * 50)
-        print('-' * 50)
-        print("Training:", cond)
-        print('-' * 50)
-        print('-' * 50)
-        print('-' * 50)
+        print(f"Training: {cond} cross step {step}")
         best = train_model(
             input_dir="../",
-            model_name=out,
             condition=cond,
             description=desc,
             scores_fct=fct,
+            step=step,
         )
-        metrics[cond] = best
+        return step, best
 
-        break
+    for cond, desc, fct, out_name in zip(conditions, descriptions, scores_fct, out_name):
+        metrics[cond] = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_to_step = {executor.submit(train_and_collect_metrics, cond, desc, fct, step): step for step in range(4)}
+            
+            for future in concurrent.futures.as_completed(future_to_step):
+                step = future_to_step[future]
+                try:
+                    step_num, best = future.result()
+                    metrics[cond].append((step_num, best))
+                    print(f"Metrics for {cond}, step {step_num}: {best}")
+                except Exception as exc:
+                    print(f"{cond}, step {step} generated an exception: {exc}")
 
-    print("Done !")
-    print(metrics)
+    print("Done!")
+    print("All metrics:", metrics)
