@@ -11,103 +11,9 @@ from scipy.ndimage import label, center_of_mass
 import warnings
 warnings.filterwarnings("ignore") # warning on lstm
 import pickle
+import concurrent.futures
+from models_axial import LumbarSegmentationModel
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-
-class ImageEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = torchvision.models.resnet34(weights="DEFAULT")
-
-    def forward(self, x):
-        x = self.backbone.conv1(x)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
-
-        x = self.backbone.layer1(x)
-        x = self.backbone.layer2(x)
-        x = self.backbone.layer3(x)
-        x = self.backbone.layer4(x)
-        return x
-
-class Upsampler(nn.Module):
-
-    def __init__(self, in_channels):
-        super().__init__()
-
-        self.inconv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(),
-        )
-        self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, in_channels // 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(in_channels // 2),
-            nn.LeakyReLU(0.021),
-            nn.Conv2d(in_channels // 2, in_channels // 2, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(in_channels // 2),
-            nn.ReLU(),
-        )
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels // 2, in_channels // 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(in_channels // 4),
-            nn.LeakyReLU(0.021),
-            nn.Conv2d(in_channels // 4, in_channels // 4, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(in_channels // 4),
-            nn.ReLU(),
-        )
-        self.up3 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels // 4, in_channels // 8, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(in_channels // 8),
-            nn.LeakyReLU(0.021),
-            nn.Conv2d(in_channels // 8, in_channels // 8, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(in_channels // 8),
-            nn.ReLU(),
-        )
-        self.lastconv = nn.Conv2d(in_channels // 8, 1, 1, 1, 0)
-
-    def forward(self, x):
-        x = self.inconv(x)
-        x = self.up1(x)
-        x = self.up2(x)
-        x = self.up3(x)
-        x = F.interpolate(x, size = (384, 384), mode="bilinear", align_corners=True)
-        x = self.lastconv(x)
-        return x
-
-class PositionHead(nn.Module):
-    def __init__(self, features_size):
-        super().__init__()
-        self.pooler = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Sequential(
-            nn.Linear(features_size, features_size // 2),
-            nn.ReLU(),
-            nn.Linear(features_size // 2, 2),
-        )
-
-    def forward(self, x):
-        x = self.pooler(x)
-        x = x.flatten(start_dim = 1)
-        x = self.fc(x)
-        return x
-        
-class LumbarSegmentationModelSagittal(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.image_encoder = ImageEncoder()
-        self.upper_head = Upsampler(in_channels = 512)
-        self.position_head = PositionHead(features_size = 512)
-
-    def forward(self, images):
-        encoded = self.image_encoder(images)
-        mask = self.upper_head(encoded)
-        positions = self.position_head(encoded)
-        return mask.sigmoid(), positions.sigmoid()
-    
 def get_instance(path):
     return int(path.split("/")[-1].split('.')[0])
 
@@ -172,20 +78,10 @@ def load_dicom_series(dicom_files):
     dicom_files = sorted(dicom_files, key = lambda x : get_instance(x))
     slices = [pydicom.dcmread(f) for f in dicom_files]
     slices = [s.pixel_array for s in slices]
-    slices = [cv2.resize(s, (224, 224), interpolation=cv2.INTER_LINEAR) for s in slices]
+    slices = [cv2.resize(s, (384, 384), interpolation=cv2.INTER_LINEAR) for s in slices]
     slices = np.array(slices)
     slices = slices.transpose(1, 2, 0)
     return slices
-
-def resize_slices_to_224(volume):
-    num_slices = volume.shape[-1]
-    resized_slices = []
-    for i in range(num_slices):
-        slice_ = volume[:, :, i]
-        resized_slice = cv2.resize(slice_, (224, 224), interpolation=cv2.INTER_LINEAR)
-        resized_slices.append(resized_slice)
-    resized_volume = np.stack(resized_slices, axis=-1)
-    return resized_volume
 
 def z_score_normalize_all_slices(scan):
     scan_flattened = scan.flatten()
@@ -232,7 +128,6 @@ class SegmentationDataset(Dataset):
     
         volume = load_dicom_series(slices_path)
         normalised_volume = z_score_normalize_all_slices(volume)
-
         normalised_volume = normalised_volume.transpose(2, 0, 1)
         images = torch.tensor(normalised_volume).float()
         return images, torch.tensor(data['output_mask']).float(), torch.tensor(data['gt_positions']), torch.tensor(data['labels_positions']).float()
@@ -360,7 +255,7 @@ def train_epoch(model, loader, criterion_mask, criterion_position, optimizer, de
     return epoch_loss
 
 
-def train_model_sagittal(input_dir, condition, description, out_name):
+def train_model_axial(input_dir, condition, description, out_name):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = generate_dataset(input_dir, condition, description)
@@ -370,10 +265,10 @@ def train_model_sagittal(input_dir, condition, description, out_name):
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=4)
 
-    model = LumbarSegmentationModelSagittal()
+    model = LumbarSegmentationModel()
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma = 0.6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma = 0.5)
     criterion_mask = torch.nn.BCELoss()
     criterion_position = torch.nn.MSELoss()
 
@@ -396,29 +291,39 @@ def train_model_sagittal(input_dir, condition, description, out_name):
 
     return best_metrics
 
+###################################################################
+###################################################################
+# MAIN TRAIN
+###################################################################
+###################################################################
 
+def train_and_collect_metrics(cond, desc, out):
+    print('-' * 50)
+    print(f"Training: {cond}")
+    best = train_model_axial(
+        input_dir="../",
+        condition=cond,
+        description=desc,
+        out_name=out
+    )
+    return best
 
 conditions = ["Left Subarticular Stenosis", "Right Subarticular Stenosis"]
 descriptions = ["Axial T2", "Axial T2"]
 out_name = ["segmentation_ax_left.ts", "segmentation_ax_right.ts"]
-metrics = dict()
+metrics = {cond: [] for cond in conditions}
 
-for cond, desc, out in zip(conditions, descriptions, out_name):
-    print('-' * 50)
-    print('-' * 50)
-    print('-' * 50)
-    print("Training:", cond)
-    print('-' * 50)
-    print('-' * 50)
-    print('-' * 50)
-    best = train_model_sagittal(
-        input_dir="/kaggle/input/rsna-2024-lumbar-spine-degenerative-classification",
-        out_name=out,
-        condition=cond,
-        description=desc,
-    )
-    metrics[cond] = best
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    future_to_cond = {executor.submit(train_and_collect_metrics, cond, desc, out): cond for cond, desc, out in zip(conditions, descriptions, out_name)}
+
+    for future in concurrent.futures.as_completed(future_to_cond):
+        cond = future_to_cond[future]
+        try:
+            best = future.result()
+            metrics[cond].append(best)
+            print(f"Metrics for {cond}: {best}")
+        except Exception as exc:
+            print(f"{cond} generated an exception: {exc}")
 
 print("Done !")
 print(metrics)
-
