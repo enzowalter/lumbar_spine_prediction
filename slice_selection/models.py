@@ -47,6 +47,7 @@ class VIT_ImageEncoder(nn.Module):
         x = x[:, 0]
         return x
 
+
 class SliceSelecterModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -80,6 +81,56 @@ class SliceSelecterModelDistinctClassifier(nn.Module):
         outputs = torch.cat([classifier(transformer_out) for classifier in self.classifiers], dim=-1)
         return outputs.permute(0, 2, 1).sigmoid()
 
+class SqueezeNetImageEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = torchvision.models.squeezenet1_0(weights="DEFAULT")
+
+    def forward(self, x):
+        x = self.model.features(x)
+        features = torch.mean(x, dim = (2, 3))
+        features = features.flatten(start_dim=1)
+        return features
+
+
+class AttentionClassifier(nn.Module):
+    def __init__(self, features_size):
+        super().__init__()
+        self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=512, nhead=8, dim_feedforward=512, batch_first=True), num_layers=2)
+        self.fc = nn.Linear(features_size, 1)
+
+    def forward(self, x):
+        t = self.transformer(x)
+        o = self.fc(t)
+        return o.sigmoid()
+
+class SliceSelecterModelSqueezeNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.image_encoder = SqueezeNetImageEncoder()
+        self.attention_classifier = nn.ModuleList([AttentionClassifier(512) for _ in range(5)])
+
+    def forward(self, images):
+        batch_size, seq_len, c, h, w = images.size()
+
+        encoded = list()
+        for i in range(seq_len):
+            if i == 0 or i == seq_len - 1:
+                im = images[:, i, ...]
+                im = im.expand(batch_size, 3, h, w)
+                encoded.append(self.image_encoder(im))
+            else:
+                im = images[:, i-1:i+2, ...].squeeze(2)
+                encoded.append(self.image_encoder(im))
+
+        encoded = torch.stack(encoded, dim = 1)
+
+        outputs = list()
+        for attention_classifier in self.attention_classifier:
+            outputs.append(attention_classifier(encoded))
+        outputs = torch.cat(outputs, dim=2)
+        return outputs.permute(0, 2, 1)
+
 class SliceSelecterModelTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -111,7 +162,7 @@ class ConvnextImageEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = timm.create_model(
-                        "convnext_small.in12k_ft_in1k",
+                        "convnext_tiny.fb_in1k",
                         pretrained=True,
         )
 
@@ -143,31 +194,6 @@ class BasicImageEncoder(nn.Module):
         x = x.flatten(start_dim = 1)
         return x
 
-class ConvnextImageEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = timm.create_model(
-                        "convnext_small.in12k_ft_in1k",
-                        pretrained=True,
-        )
-        self.fc = nn.Linear(768, 256)
-
-    def forward(self, x):
-        x = self.model.forward_features(x)
-        features = torch.mean(x, dim = (2, 3))
-        features = self.fc(features)
-        return features
-
-class SqueezeNetImageEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = torchvision.models.squeezenet1_0(weights="DEFAULT")
-
-    def forward(self, x):
-        x = self.model.features(x)
-        features = torch.mean(x, dim = (2, 3))
-        features = features.flatten(start_dim=1)
-        return features
 
 
 class REM_SliceSelecterModel(nn.Module):
