@@ -196,7 +196,7 @@ def train_epoch(model, loader, criterion, optimizer, accumulation_step, device):
         labels = labels.to(device)
 
         # predictions = model(images)
-        predictions = model(images)
+        predictions, predictions_logits = model(images)
 
         #loss = criterion(predictions, labels)
         loss = criterion(predictions, labels) / accumulation_step
@@ -340,14 +340,26 @@ if __name__ == "__main__":
     # print("Done!")
     # print("All metrics:", metrics)
 
+    class SliceSelecterMetamodel(nn.Module):
+        def __init__(self, models):
+            super().__init__()
+            self.models = nn.ModuleList(models)
+
+        def forward(self, images):
+            outputs = list()
+            for model in self.models:
+                preds_probs, preds_logits = model(images)
+                outputs.append(preds_probs)
+            outputs = torch.stack(outputs, dim = 1)
+            outputs = torch.mean(outputs, dim = 1)
+            return outputs
 
     # test metamodels
-
     conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis", "Left Subarticular Stenosis", "Right Subarticular Stenosis"]
     descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR", "Axial T2", "Axial T2"]
     out_name = ["slice_selector_st1_left_bs16.ts", "slice_selector_st1_right_bs16.ts", "slice_selector_st2_bs16.ts", "slice_selector_ax_left_bs16.ts", "slice_selector_ax_right_bs16.ts"]
     scores_fct = [generate_scores, generate_scores, generate_scores, generate_scores, generate_scores]
-    model_folder = "../trained_models/v13_slice_selection/"
+    model_folder = "../trained_models/v12_slice_selection/"
     metamodels = [
     f"{model_folder}/slice_selector_st1_left_metamodel.ts", 
     f"{model_folder}/slice_selector_st1_right_metamodel.ts", 
@@ -355,24 +367,20 @@ if __name__ == "__main__":
     f"{model_folder}/slice_selector_ax_left_metamodel.ts", 
     f"{model_folder}/slice_selector_ax_right_metamodel.ts"
 ]
-    # Left Neural Foraminal Narrowing: {1: 0.678, 3: 0.988, 5: 0.996, 10: 1.0}
-    # Right Neural Foraminal Narrowing: {1: 0.69, 3: 0.992, 5: 1.0, 10: 1.0}
-    # Spinal Canal Stenosis: {1: 0.7670103092783506, 3: 0.9896907216494846, 5: 0.9958762886597938, 10: 1.0}
-    # Left Subarticular Stenosis: {1: 0.6325, 3: 0.9425, 5: 0.9575, 10: 0.99}
-    # Right Subarticular Stenosis: {1: 0.655421686746988, 3: 0.9590361445783132, 5: 0.9662650602409638, 10: 0.9951807228915662}
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     criterion = FocalLoss(alpha=1, gamma=2)
     for cond, desc, fct, model_path in zip(conditions, descriptions, scores_fct, metamodels):
         
-        model = torch.jit.load(model_path)
-        model = model.eval().to(device)
+        new_metamodel = SliceSelecterMetamodel([SliceSelecterModelTransformer() for _ in range(4)])
 
+        model = torch.jit.load(model_path)
+        new_metamodel.load_state_dict(model.state_dict())
+        new_metamodel = new_metamodel.eval().to(device)
         dataset = generate_dataset("../", cond, desc, fct)
 
         valid_dataset = SlicePredicterDataset(dataset)
         valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=4)
-        loss_valid, instance_accuracy = validate(model, valid_loader, criterion, device)
+        loss_valid, instance_accuracy = validate(new_metamodel, valid_loader, criterion, device)
         
         print()
         print(cond)

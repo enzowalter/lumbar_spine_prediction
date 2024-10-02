@@ -256,7 +256,7 @@ def validate(model, loader, criterion, device):
     avg_classification_loss = classification_loss_sum / len(loader)
     return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device, epoch):
     model.train()
     epoch_loss = 0
     for images, labels in tqdm.tqdm(loader, desc="Training", total=len(loader)):
@@ -264,7 +264,11 @@ def train_epoch(model, loader, criterion, optimizer, device):
         images = images.to(device)
         labels = labels.to(device).long()
 
-        predictions = model(images.to(device), mode="train")
+        if (epoch + 1) % 4 == 0:
+            predictions = model(images.to(device), mode="train_gate")
+        else:
+            predictions = model(images.to(device), mode="train")
+
         loss = criterion(predictions, labels)
         loss.backward()
         optimizer.step()
@@ -280,16 +284,16 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, crop
     train_dataset = CropClassifierDataset(dataset[nb_valid:], is_train=True)
     valid_dataset = CropClassifierDataset(dataset[:nb_valid], is_train=False)
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
-    valid_loader = DataLoader(valid_dataset, batch_size=1)
+    valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=4)
 
-
-    backbones_768 = ['focalnet_small_lrf.ms_in1k', 'cs3darknet_m.c2ns_in1k', 'convnextv2_tiny.fcmae_ft_in1k', 'twins_svt_base.in1k']
     #backbones = ['cspresnet50.ra_in1k', 'convnext_base.fb_in22k_ft_in1k', 'ese_vovnet39b.ra_in1k', 'densenet161.tv_in1k', 'dm_nfnet_f0.dm_in1k']
-    backbones_1024=['focalnet_base_lrf.ms_in1k', 'densenet121.ra_in1k', 'convnext_base.fb_in1k', 'darknet53.c2ns_in1k', 'hgnetv2_b1.ssld_stage2_ft_in1k']
+    #backbones_1024=['focalnet_base_lrf.ms_in1k', 'densenet121.ra_in1k', 'convnext_base.fb_in1k', 'darknet53.c2ns_in1k', 'hgnetv2_b1.ssld_stage2_ft_in1k']
+    backbones = ['focalnet_small_lrf.ms_in1k', 'convnext_base.fb_in22k_ft_in1k', 'dm_nfnet_f0.dm_in1k', 'ecaresnet26t.ra2_in1k', 'resnet34.a1_in1k']
     model = REM(
         n_classes=3,
-        n_fold_classifier=3,
-        backbones=backbones_1024,
+        nb_classifiers=3,
+        unification_features_size=1024,
+        backbones=backbones,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -299,11 +303,11 @@ def train_submodel(input_dir, model_name, crop_description, crop_condition, crop
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
     for epoch in range(15):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, device)
+        loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
-            print("New best model !", "Weights encoders", model.weights_encoders)
+            print("New best model !", "Weights encoders", model.weights_encoders_per_classifier)
             best = metrics["concat_loss"]
             # torch.save(model.state_dict(), model_name)
         print('-' * 50)
@@ -318,13 +322,10 @@ if __name__ == "__main__":
     out_name = ["classification_st1_left.pth", "classification_st1_right.pth", "classification_st2.pth", "classification_ax_left.pth", "classification_ax_right.pth"]
 
     metrics = dict()
-
     for cond, desc, csize, out in zip(conditions, descriptions, crop_sizes, out_name):
         print('-' * 50)
         print('-' * 50)
-        print('-' * 50)
         print("Training:", cond)
-        print('-' * 50)
         print('-' * 50)
         print('-' * 50)
         best = train_submodel(
@@ -336,6 +337,7 @@ if __name__ == "__main__":
             image_resize=(640, 640),
         )
         metrics[cond] = best
+        break
 
     print("Done !")
     print(metrics)

@@ -102,7 +102,7 @@ class AttentionClassifier(nn.Module):
     def forward(self, x):
         t = self.transformer(x)
         o = self.fc(t)
-        return o.sigmoid()
+        return o
 
 class SliceSelecterModelSqueezeNet(nn.Module):
     def __init__(self):
@@ -129,7 +129,8 @@ class SliceSelecterModelSqueezeNet(nn.Module):
         for attention_classifier in self.attention_classifier:
             outputs.append(attention_classifier(encoded))
         outputs = torch.cat(outputs, dim=2)
-        return outputs.permute(0, 2, 1)
+        outputs = outputs.permute(0, 2, 1)
+        return outputs.sigmoid(), outputs
 
 class SliceSelecterModelTransformer(nn.Module):
     def __init__(self):
@@ -156,7 +157,8 @@ class SliceSelecterModelTransformer(nn.Module):
         transformer_out = self.transformer_encoder(encoded)
         transformer_out = transformer_out.permute(1, 0, 2)
         outputs = self.classifiers(transformer_out)
-        return outputs.permute(0, 2, 1).sigmoid()
+        outputs = outputs.permute(0, 2, 1)
+        return outputs.sigmoid(), outputs
 
 class ConvnextImageEncoder(nn.Module):
     def __init__(self):

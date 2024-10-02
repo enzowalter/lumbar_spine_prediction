@@ -9,9 +9,13 @@ class SliceSelecterMetamodel(nn.Module):
         self.models = nn.ModuleList(models)
 
     def forward(self, images):
-        outputs = torch.stack([m(images) for m in self.models], dim = 1)
+        outputs = list()
+        for model in self.models:
+            preds_probs, preds_logits = model(images)
+            outputs.append(preds_logits)
+        outputs = torch.stack(outputs, dim = 1)
         outputs = torch.mean(outputs, dim = 1)
-        return outputs
+        return outputs.sigmoid()
 
 def make_metamodel(condition, nb_steps, out_name):
     models = list()
