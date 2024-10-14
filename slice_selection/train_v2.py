@@ -29,16 +29,11 @@ def create_soft_labels(hard_labels, radius=2, sigma=1.0, max_value=1.0):
                     soft_labels[idx + i] = max_value * np.exp(-0.5 * (i / sigma) ** 2)
     return soft_labels
 
+
 def generate_scores(num_images, index):
     scores = np.zeros(num_images)
     scores[index] = 1
     return create_soft_labels(scores)
-
-import pydicom
-import numpy as np
-from scipy.ndimage import zoom
-import cv2
-
 
 def resize_slices_to_224(volume):
     num_slices = volume.shape[-1]
@@ -59,16 +54,9 @@ def load_dicom_series(dicom_files):
     slices = slices.transpose(1, 2, 0)
     return slices
 
-def resample_volume(volume, slice_thickness, pixel_spacing, new_spacing=[1.0, 1.0, 1.0]):
-    current_spacing = [slice_thickness] + pixel_spacing
-    resize_factor = np.array(current_spacing) / np.array(new_spacing)
-    resampled_volume = zoom(volume, resize_factor, mode='nearest')
-    return resampled_volume
-
 def z_score_normalize_all_slices(scan):
-    scan_flattened = scan.flatten()
-    mean = np.mean(scan_flattened)
-    std = np.std(scan_flattened)
+    mean = np.mean(scan)
+    std = np.std(scan)
     z_normalized_scan = (scan - mean) / std
     return z_normalized_scan
 
@@ -83,7 +71,7 @@ def generate_dataset(input_dir, condition, description, scores_fct):
 
     dataset = list()
     # keep 100 for tests
-    for study_id in tqdm.tqdm(studies_id[:100], desc="Generates slices hotmap"):
+    for study_id in tqdm.tqdm(studies_id[:180], desc="Generates slices hotmap"):
 
         series_id = df_study_descriptions[(df_study_descriptions['study_id'] == study_id)
                                         & (df_study_descriptions['series_description'] == description)]['series_id'].to_list()
@@ -136,7 +124,6 @@ class SlicePredicterDataset(Dataset):
         labels = data['labels']
         slices = data['slices_path']
         volume = load_dicom_series(slices)
-        # resized_volume = resize_slices_to_224(volume)
         normalised_volume = z_score_normalize_all_slices(volume)
 
         normalised_volume = normalised_volume.transpose(2, 0, 1)
@@ -173,6 +160,33 @@ def validate(model, loader, criterion, device):
         with torch.no_grad():
             images = images.to(device)
             labels = labels.to(device)
+            predictions, _ = model(images)
+            loss = criterion(predictions, labels)
+            
+            for level in range(5):
+                preds = predictions[:, level]
+                gt_indice = gt_indices[:, level].item()
+
+                for top in tops: 
+                    tops[top] += 1 if get_max_consecutive(preds.squeeze(0), gt_indice, top) else 0
+
+            valid_loss += loss.item() / len(loader)
+    return valid_loss, {t: tops[t] / (len(loader) * 5) for t in tops}
+
+def validate_metamodel(model, loader, criterion, device):
+    model.eval()
+
+    valid_loss = 0
+    tops = {
+        1: 0,
+        3: 0,
+        5: 0,
+        10: 0,
+    }
+    for images, labels, gt_indices in tqdm.tqdm(loader, desc="Valid"):
+        with torch.no_grad():
+            images = images.to(device)
+            labels = labels.to(device)
             predictions = model(images)
             loss = criterion(predictions, labels)
             
@@ -185,6 +199,7 @@ def validate(model, loader, criterion, device):
 
             valid_loss += loss.item() / len(loader)
     return valid_loss, {t: tops[t] / (len(loader) * 5) for t in tops}
+
 
 def train_epoch(model, loader, criterion, optimizer, accumulation_step, device):
     model.train()
@@ -239,6 +254,7 @@ def train_model(input_dir, condition, description, scores_fct, step):
     dataset = generate_dataset(input_dir, condition, description, scores_fct)
 
     # select validation and training set
+    
     nb_valid = len(dataset) // 4
     valid_indices = list(range(step * nb_valid, (step + 1) * nb_valid))
     all_indices = list(range(len(dataset)))
@@ -251,7 +267,7 @@ def train_model(input_dir, condition, description, scores_fct, step):
     train_loader = DataLoader(train_dataset, batch_size=1, num_workers=4, pin_memory=True)
     valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=4)
 
-    model = SliceSelecterModelSqueezeNet()
+    model = SliceSelecterModelTransformer()
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     criterion = FocalLoss(alpha=1, gamma=2)
@@ -276,11 +292,42 @@ def train_model(input_dir, condition, description, scores_fct, step):
 
 if __name__ == "__main__":
 
-    # conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis", "Left Subarticular Stenosis", "Right Subarticular Stenosis"]
-    # descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR", "Axial T2", "Axial T2"]
-    # out_name = ["slice_selector_st1_left_bs16.ts", "slice_selector_st1_right_bs16.ts", "slice_selector_st2_bs16.ts", "slice_selector_ax_left_bs16.ts", "slice_selector_ax_right_bs16.ts"]
-    # scores_fct = [generate_scores, generate_scores, generate_scores, generate_scores, generate_scores]
+    conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis", "Left Subarticular Stenosis", "Right Subarticular Stenosis"]
+    descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR", "Axial T2", "Axial T2"]
+    out_name = ["slice_selector_st1_left_bs16.ts", "slice_selector_st1_right_bs16.ts", "slice_selector_st2_bs16.ts", "slice_selector_ax_left_bs16.ts", "slice_selector_ax_right_bs16.ts"]
+    scores_fct = [generate_scores, generate_scores, generate_scores, generate_scores, generate_scores]
 
+    # All metrics: {
+    #     'Left Neural Foraminal Narrowing': [
+    #         (0, {1: 0.6345528455284553, 3: 0.9841463414634146, 5: 0.9922764227642277, 10: 0.9995934959349594}), 
+    #         (1, {1: 0.6239837398373984, 3: 0.9800813008130081, 5: 0.9910569105691057, 10: 0.9963414634146341}), 
+    #         (2, {1: 0.6426829268292683, 3: 0.983739837398374, 5: 0.9922764227642277, 10: 0.9947154471544716}), 
+    #         (3, {1: 0.6524390243902439, 3: 0.9796747967479674, 5: 0.990650406504065, 10: 0.9959349593495935})], 
+    #     'Right Neural Foraminal Narrowing': [
+    #         (0, {1: 0.6105691056910569, 3: 0.9760162601626017, 5: 0.9898373983739838, 10: 0.9963414634146341}), 
+    #         (1, {1: 0.6565040650406504, 3: 0.9861788617886179, 5: 0.990650406504065, 10: 0.9967479674796748}), 
+    #         (2, {1: 0.6495934959349593, 3: 0.9869918699186991, 5: 0.9926829268292683, 10: 0.9955284552845528}), 
+    #         (3, {1: 0.6260162601626016, 3: 0.9841463414634146, 5: 0.9943089430894309, 10: 0.9979674796747967})], 
+    #     'Spinal Canal Stenosis': [
+    #         (0, {1: 0.7749469214437368, 3: 0.9936305732484076, 5: 0.9991507430997877, 10: 1.0}), 
+    #         (1, {1: 0.7609341825902336, 3: 0.9961783439490446, 5: 0.9983014861995754, 10: 0.9995753715498938}), 
+    #         (3, {1: 0.7609341825902336, 3: 0.9953290870488323, 5: 0.9983014861995754, 10: 1.0}), 
+    #         (2, {1: 0.7762208067940553, 3: 0.9949044585987261, 5: 0.9983014861995754, 10: 0.9995753715498938})], 
+    #     'Left Subarticular Stenosis': [], 'Right Subarticular Stenosis': []
+    #     }
+    # 'Left Subarticular Stenosis': [
+    #     (0, {1: 0.5843434343434344, 3: 0.9444444444444444, 5: 0.9651515151515152, 10: 0.9939393939393939}), (
+    #         1, {1: 0.5767676767676768, 3: 0.9318181818181818, 5: 0.9505050505050505, 10: 0.9914141414141414}), 
+    #         (2, {1: 0.5898989898989899, 3: 0.946969696969697, 5: 0.9626262626262626, 10: 0.9924242424242424}), 
+    #         (3, {1: 0.591919191919192, 3: 0.9454545454545454, 5: 0.9651515151515152, 10: 0.9934343434343434})], 
+    # 'Right Subarticular Stenosis': [
+    #     (0, {1: 0.6326633165829145, 3: 0.9522613065326633, 5: 0.964321608040201, 10: 0.9964824120603015}), 
+    #     (1, {1: 0.5959798994974874, 3: 0.942713567839196, 5: 0.9577889447236181, 10: 0.9969849246231156}), 
+    #     (2, {1: 0.6060301507537689, 3: 0.9381909547738694, 5: 0.9577889447236181, 10: 0.9899497487437185}), 
+    #     (3, {1: 0.6231155778894473, 3: 0.9492462311557789, 5: 0.9628140703517588, 10: 0.9919597989949749})]
+
+
+    # v0
     # All metrics: {
     #     'Left Neural Foraminal Narrowing': [
     #         (1, {1: 0.6115631691648822, 3: 0.974304068522484, 5: 0.9888650963597431, 10: 0.9948608137044967}),
@@ -323,9 +370,12 @@ if __name__ == "__main__":
     #     return step, best
 
     # for cond, desc, fct, out_name in zip(conditions, descriptions, scores_fct, out_name):
+    #     if not "Subarticular" in cond:
+    #         continue
+
     #     metrics[cond] = []
         
-    #     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    #     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
     #         future_to_step = {executor.submit(train_and_collect_metrics, cond, desc, fct, step): step for step in range(4)}
             
     #         for future in concurrent.futures.as_completed(future_to_step):
@@ -340,48 +390,58 @@ if __name__ == "__main__":
     # print("Done!")
     # print("All metrics:", metrics)
 
+    # class SliceSelecterMetamodel(nn.Module):
+    #     def __init__(self, models):
+    #         super().__init__()
+    #         self.models = nn.ModuleList(models)
+
+    #     def forward(self, images):
+    #         outputs = list()
+    #         for model in self.models:
+    #             _, preds_logits = model(images)
+    #             outputs.append(preds_logits)
+    #         outputs = torch.stack(outputs, dim = 1)
+    #         outputs = torch.mean(outputs, dim = 1)
+    #         return outputs.sigmoid()
+
     class SliceSelecterMetamodel(nn.Module):
         def __init__(self, models):
             super().__init__()
             self.models = nn.ModuleList(models)
 
         def forward(self, images):
-            outputs = list()
-            for model in self.models:
-                preds_probs, preds_logits = model(images)
-                outputs.append(preds_probs)
-            outputs = torch.stack(outputs, dim = 1)
-            outputs = torch.mean(outputs, dim = 1)
-            return outputs
+            outputs = [model(images)[1] for model in self.models]
+            outputs = torch.stack(outputs, dim=1)
+            return outputs.mean(dim=1).sigmoid()
 
     # test metamodels
     conditions = ["Left Neural Foraminal Narrowing", "Right Neural Foraminal Narrowing", "Spinal Canal Stenosis", "Left Subarticular Stenosis", "Right Subarticular Stenosis"]
     descriptions = ["Sagittal T1", "Sagittal T1", "Sagittal T2/STIR", "Axial T2", "Axial T2"]
-    out_name = ["slice_selector_st1_left_bs16.ts", "slice_selector_st1_right_bs16.ts", "slice_selector_st2_bs16.ts", "slice_selector_ax_left_bs16.ts", "slice_selector_ax_right_bs16.ts"]
+    out_name = ["slice_selector_st1_left_metamodel.ts", "slice_selector_st1_right_metamodel.ts", "slice_selector_st2_metamodel.ts", "slice_selector_ax_left_metamodel.ts", "slice_selector_ax_right_metamodel.ts"]
     scores_fct = [generate_scores, generate_scores, generate_scores, generate_scores, generate_scores]
-    model_folder = "../trained_models/v12_slice_selection/"
-    metamodels = [
-    f"{model_folder}/slice_selector_st1_left_metamodel.ts", 
-    f"{model_folder}/slice_selector_st1_right_metamodel.ts", 
-    f"{model_folder}/slice_selector_st2_metamodel.ts", 
-    f"{model_folder}/slice_selector_ax_left_metamodel.ts", 
-    f"{model_folder}/slice_selector_ax_right_metamodel.ts"
-]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     criterion = FocalLoss(alpha=1, gamma=2)
-    for cond, desc, fct, model_path in zip(conditions, descriptions, scores_fct, metamodels):
+    for cond, desc, fct, o in zip(conditions, descriptions, scores_fct, out_name):
         
-        new_metamodel = SliceSelecterMetamodel([SliceSelecterModelTransformer() for _ in range(4)])
+        models = list()
+        for step in range(4):
+            current_name = f"trained_models/{cond.lower().replace(' ', '_')}_step_{step}.pth"
+            step_model = SliceSelecterModelTransformer()
+            step_model.load_state_dict(torch.load(current_name, weights_only=True, map_location='cpu'))
+            models.append(step_model)
 
-        model = torch.jit.load(model_path)
-        new_metamodel.load_state_dict(model.state_dict())
+        new_metamodel = SliceSelecterMetamodel(models)
         new_metamodel = new_metamodel.eval().to(device)
         dataset = generate_dataset("../", cond, desc, fct)
 
         valid_dataset = SlicePredicterDataset(dataset)
         valid_loader = DataLoader(valid_dataset, batch_size=1, num_workers=4)
-        loss_valid, instance_accuracy = validate(new_metamodel, valid_loader, criterion, device)
+        loss_valid, instance_accuracy = validate_metamodel(new_metamodel, valid_loader, criterion, device)
         
+        scripted_model = torch.jit.script(new_metamodel)
+        scripted_model.save(o)
+
         print()
         print(cond)
         print(loss_valid, instance_accuracy)

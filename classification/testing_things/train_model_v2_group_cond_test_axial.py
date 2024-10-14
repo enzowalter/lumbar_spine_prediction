@@ -38,14 +38,14 @@ def extract_centered_square_with_padding(array, center_x, center_y, sizeX, sizeY
     return square
 
 def cut_crops(slices_path, x, y, crop_size, image_resize, flip):
-    output_crops = np.zeros((len(slices_path), 128, 128))
+    output_crops = np.zeros((len(slices_path), 224, 224))
     for k, slice_path in enumerate(slices_path):
         pixel_array = pydicom.dcmread(slice_path).pixel_array.astype(np.float32)
         pixel_array = cv2.resize(pixel_array, image_resize, interpolation=cv2.INTER_LINEAR)
         crop = extract_centered_square_with_padding(pixel_array, y, x, *crop_size) # x y reversed in array
         if flip:
             crop = cv2.flip(crop, 1)
-        crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_LINEAR)
+        crop = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR)
         output_crops[k, ...] = crop
     return output_crops
 
@@ -229,7 +229,10 @@ class CropClassifierDataset(Dataset):
             crops = cut_crops(slices_path, x, y, data['crop_size'], data['image_resize'], flip = False)
         crops = z_score_normalize_all_slices(crops)
         crops = torch.tensor(crops).float()
-        crops = crops.unsqueeze(1).expand(5, 3, 128, 128)
+        crops = crops.unsqueeze(1).expand(5, 3, 224, 224)
+
+        # if self.is_train:
+        #     crops = self.transforms(crops)
 
         weights_crops = create_soft_labels_at_index(good_slice_idx)
         weights_crops = torch.softmax(torch.tensor(weights_crops), dim=0)
@@ -361,7 +364,9 @@ def train_submodel(model_name, flip_right, datasets):
     print("-" * 50)
     print("-" * 50)
     print("-" * 50)
+    print("-" * 50)
     print("TRAINING", model_name)
+    print("-" * 50)
     print("-" * 50)
     print("-" * 50)
     print("-" * 50)
@@ -369,12 +374,12 @@ def train_submodel(model_name, flip_right, datasets):
     train_loader, valid_loader = get_loaders(datasets, flip_right)
 
     backbones = [
-        'hgnet_tiny.paddle_in1k', 
+        'seresnext101_32x4d.gluon_in1k', 
         'densenet201.tv_in1k', 
-        'regnety_008.pycls_in1k', 
-        'focalnet_tiny_lrf.ms_in1k', 
+        'twins_svt_small.in1k', 
+        'focalnet_small_lrf.ms_in1k', 
         'convnext_base.fb_in22k_ft_in1k',
-        'seresnext101_32x4d.gluon_in1k',
+        'deit_tiny_patch16_224.fb_in1k',
     ]
 
     model = REM(
@@ -409,12 +414,13 @@ def train_submodel(model_name, flip_right, datasets):
 if __name__ == "__main__":
 
     conditions = [
-        ["Left Subarticular Stenosis"], 
+        ["Left Subarticular Stenosis"],
         ["Right Subarticular Stenosis"],
+        ["Left Subarticular Stenosis", "Right Subarticular Stenosis"]
     ]
-    crop_sizes = [(128, 128), (128, 128)]
-    out_name = ["trained_axial/left128", "trained_axial/right128"]
-    use_flip = [False, False]
+    crop_sizes = [(184, 184)]
+    out_name = ["trained_axial/classification_axial_right", "trained_axial/classification_axial_right", "trained_axial/classification_axial_both"]
+    use_flip = [False, False, True]
 
     metrics = dict()
     def train_and_collect_metrics(model_name, flip, datasets, step):
@@ -433,7 +439,7 @@ if __name__ == "__main__":
         datasets = generate_dataset("../", cond, cs, (640, 640))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future_to_step = {executor.submit(train_and_collect_metrics, f"{out}_step_{step}.pth", flip, datasets, step): step for step in range(1)}
+            future_to_step = {executor.submit(train_and_collect_metrics, f"{out}_step_{step}.pth", flip, datasets, step): step for step in range(2)}
             
             for future in concurrent.futures.as_completed(future_to_step):
                 step = future_to_step[future]
@@ -446,3 +452,52 @@ if __name__ == "__main__":
 
     print("Done!")
     print("All metrics:", metrics)
+
+    # class ClassifierMetamodel(nn.Module):
+    #     def __init__(self, models):
+    #         super().__init__()
+    #         self.models = nn.ModuleList(models)
+
+    #     def forward(self, images):
+    #         outputs = [model(images) for model in self.models]
+    #         outputs = torch.stack(outputs, dim=1)
+    #         return outputs.mean(dim=1)
+
+
+
+    # condition = ['Right Neural Foraminal Narrowing']
+    # models_path = "trained_models/classification_st1_right"
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
+
+    # datasets = generate_dataset("../", condition, (80, 120), (640, 640))
+    # _, valid_loder = get_loaders(datasets, flip_right=False)
+
+    # models = list()
+
+    # for step in range(5):
+    #     p = f"{models_path}_step_{step}.pth"
+    #     backbones = [
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #     ]
+    #     fold_model = REM_torchscript(
+    #         n_classes=3,
+    #         n_classifiers=2,
+    #         unification_size=512,
+    #         backbones=backbones,
+    #     )
+    #     fold_model.load_state_dict(torch.load(p, weights_only=True, map_location='cuda:0'))
+    #     models.append(fold_model)
+
+    # metamodel = ClassifierMetamodel(models)
+    # metamodel = metamodel.eval()
+    # metamodel = metamodel.cuda()
+
+    # metrics = validate_metamodel(metamodel, valid_loder, criterion, device)
+    # print(metrics)
+
+    # scripted_model = torch.jit.script(metamodel)
+    # scripted_model.save("classification_st1_right.ts")

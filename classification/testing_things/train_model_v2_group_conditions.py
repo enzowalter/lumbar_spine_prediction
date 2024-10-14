@@ -132,12 +132,19 @@ def create_soft_labels_at_index(center_idx):
             soft_labels[center_idx + offset] = weight
     return soft_labels
 
-def z_score_normalize_all_slices(scan):
-    scan_flattened = scan.flatten()
-    mean = np.mean(scan_flattened)
-    std = np.std(scan_flattened)
-    z_normalized_scan = (scan - mean) / std
-    return z_normalized_scan
+# def z_score_normalize_all_slices(scan):
+#     scan_flattened = scan.flatten()
+#     mean = np.mean(scan_flattened)
+#     std = np.std(scan_flattened)
+#     z_normalized_scan = (scan - mean) / std
+#     return z_normalized_scan
+
+def z_score_normalize_all_slices(x):
+    lower, upper = np.percentile(x, (1, 99))
+    x = np.clip(x, lower, upper)
+    x = x - np.min(x)
+    x = x / np.max(x) 
+    return x
 
 def get_soft_data_transforms():
     return transforms.Compose([
@@ -231,6 +238,9 @@ class CropClassifierDataset(Dataset):
         crops = torch.tensor(crops).float()
         crops = crops.unsqueeze(1).expand(5, 3, 128, 128)
 
+        # if self.is_train:
+        #     crops = self.transforms(crops)
+
         weights_crops = create_soft_labels_at_index(good_slice_idx)
         weights_crops = torch.softmax(torch.tensor(weights_crops), dim=0)
 
@@ -322,6 +332,11 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch):
         good_slice_idx = good_slice_idx.to(device).long()
         gt_weights = gt_weights.to(device).float()
         
+        # if (epoch + 1) % 5 == 0:
+        #     outputs, _, _ = model(images, mode = "train_encoder_weights")
+        #     classification_loss = criterion(outputs, labels)
+        #     total_loss = classification_loss
+        # else:
         outputs, crops_weights, _ = model(images, mode = "train")
         weights_loss = nn.BCELoss()(crops_weights, gt_weights)
     
@@ -333,7 +348,6 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch):
         optimizer.step()
 
         epoch_loss += total_loss.item() / len(loader)
-
 
     return epoch_loss
 
@@ -361,7 +375,9 @@ def train_submodel(model_name, flip_right, datasets):
     print("-" * 50)
     print("-" * 50)
     print("-" * 50)
+    print("-" * 50)
     print("TRAINING", model_name)
+    print("-" * 50)
     print("-" * 50)
     print("-" * 50)
     print("-" * 50)
@@ -409,12 +425,14 @@ def train_submodel(model_name, flip_right, datasets):
 if __name__ == "__main__":
 
     conditions = [
-        ["Left Subarticular Stenosis"], 
-        ["Right Subarticular Stenosis"],
+        ['Spinal Canal Stenosis'],
+        ["Left Neural Foraminal Narrowing"], 
+        ["Right Neural Foraminal Narrowing"],
+        ["Left Subarticular Stenosis", "Right Subarticular Stenosis"]
     ]
-    crop_sizes = [(128, 128), (128, 128)]
-    out_name = ["trained_axial/left128", "trained_axial/right128"]
-    use_flip = [False, False]
+    crop_sizes = [(80, 120), (80, 120), (80, 120), (128, 128)]
+    out_name = ["trained_models/classification_st2", "trained_models/classification_st1_left", "trained_models/classification_st1_right", "trained_models/classification_axial"]
+    use_flip = [False, False, False, True]
 
     metrics = dict()
     def train_and_collect_metrics(model_name, flip, datasets, step):
@@ -428,6 +446,8 @@ if __name__ == "__main__":
         return step, best
 
     for cond, cs, out, flip in zip(conditions, crop_sizes, out_name, use_flip):
+        if "Spinal Canal Stenosis" in cond[0]:
+            continue
 
         metrics[str(cond)] = []
         datasets = generate_dataset("../", cond, cs, (640, 640))
@@ -446,3 +466,52 @@ if __name__ == "__main__":
 
     print("Done!")
     print("All metrics:", metrics)
+
+    # class ClassifierMetamodel(nn.Module):
+    #     def __init__(self, models):
+    #         super().__init__()
+    #         self.models = nn.ModuleList(models)
+
+    #     def forward(self, images):
+    #         outputs = [model(images) for model in self.models]
+    #         outputs = torch.stack(outputs, dim=1)
+    #         return outputs.mean(dim=1)
+
+
+
+    # condition = ['Right Neural Foraminal Narrowing']
+    # models_path = "trained_models/classification_st1_right"
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
+
+    # datasets = generate_dataset("../", condition, (80, 120), (640, 640))
+    # _, valid_loder = get_loaders(datasets, flip_right=False)
+
+    # models = list()
+
+    # for step in range(5):
+    #     p = f"{models_path}_step_{step}.pth"
+    #     backbones = [
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #         'convnext_base.fb_in22k_ft_in1k', 
+    #     ]
+    #     fold_model = REM_torchscript(
+    #         n_classes=3,
+    #         n_classifiers=2,
+    #         unification_size=512,
+    #         backbones=backbones,
+    #     )
+    #     fold_model.load_state_dict(torch.load(p, weights_only=True, map_location='cuda:0'))
+    #     models.append(fold_model)
+
+    # metamodel = ClassifierMetamodel(models)
+    # metamodel = metamodel.eval()
+    # metamodel = metamodel.cuda()
+
+    # metrics = validate_metamodel(metamodel, valid_loder, criterion, device)
+    # print(metrics)
+
+    # scripted_model = torch.jit.script(metamodel)
+    # scripted_model.save("classification_st1_right.ts")

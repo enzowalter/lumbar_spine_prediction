@@ -345,7 +345,7 @@ def get_loaders(datasets, flip_right):
     for dataset in datasets:
         nb_valid = int(len(dataset) * 0.1)
         train_dataset = CropClassifierDataset(dataset[nb_valid:], flip_right, weight_labels=False, is_train=True)
-        valid_dataset = CropClassifierDataset(dataset[:nb_valid], flip_right, weight_labels=False, is_train=False)
+        valid_dataset = CropClassifierDataset(dataset[:nb_valid], flip_right, weight_labels=False, is_train=True)
         valid_datasets.append(valid_dataset)
         train_datasets.append(train_dataset)
     
@@ -391,7 +391,7 @@ def train_submodel(model_name, flip_right, datasets):
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
 
-    for epoch in range(20):
+    for epoch in range(30):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
         metrics = validate(model, valid_loader, criterion, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
@@ -409,40 +409,27 @@ def train_submodel(model_name, flip_right, datasets):
 if __name__ == "__main__":
 
     conditions = [
-        ["Left Subarticular Stenosis"], 
-        ["Right Subarticular Stenosis"],
+        ["Left Subarticular Stenosis"],
+        ["Right Subarticular Stenosis"]
     ]
     crop_sizes = [(128, 128), (128, 128)]
-    out_name = ["trained_axial/left128", "trained_axial/right128"]
-    use_flip = [False, False]
+    out_name = [
+        "../trained_models/v22_classification/classification_axial.ts",
+        "../trained_models/v22_classification/classification_axial.ts"
+    ]
+    use_flip = [False, True]
 
-    metrics = dict()
-    def train_and_collect_metrics(model_name, flip, datasets, step):
-        print('-' * 50)
-        print(f"Training: {cond}")
-        best = train_submodel(
-            model_name=model_name,
-            flip_right=flip,
-            datasets = datasets,
-        )
-        return step, best
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
 
     for cond, cs, out, flip in zip(conditions, crop_sizes, out_name, use_flip):
 
-        metrics[str(cond)] = []
         datasets = generate_dataset("../", cond, cs, (640, 640))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future_to_step = {executor.submit(train_and_collect_metrics, f"{out}_step_{step}.pth", flip, datasets, step): step for step in range(1)}
-            
-            for future in concurrent.futures.as_completed(future_to_step):
-                step = future_to_step[future]
-                try:
-                    step_num, best = future.result()
-                    metrics[str(cond)].append((step_num, best))
-                    print(f"Metrics for {cond}, step {step_num}: {best}")
-                except Exception as exc:
-                    print(f"{cond}, step {step} generated an exception: {exc}")
-
-    print("Done!")
-    print("All metrics:", metrics)
+        train_loader, valid_loader = get_loaders(datasets, flip)
+        model = torch.jit.load(out).eval()
+        model = model.to(device)
+        with torch.no_grad():
+            metrics = validate_metamodel(model, valid_loader, criterion, device)
+        print("Cond:", cond)
+        print(metrics)
+        print('-' * 50)

@@ -152,6 +152,15 @@ class CropClassifierDataset(Dataset):
         self.flip_right = flip_right
         self.transforms = get_soft_data_transforms()
 
+        nb_normal = len([x for x in self.datas if x['gt_label'] == 0])
+        nb_moderate = len([x for x in self.datas if x['gt_label'] == 1])
+        nb_severe = len([x for x in self.datas if x['gt_label'] == 2])
+
+        if is_train == True:
+            print("nb_normal", nb_normal)
+            print("nb_moderate", nb_moderate)
+            print("nb_severe", nb_severe)
+
         if weight_labels:
             print('-' * 50)
             print("Sampling dataset")
@@ -230,6 +239,9 @@ class CropClassifierDataset(Dataset):
         crops = z_score_normalize_all_slices(crops)
         crops = torch.tensor(crops).float()
         crops = crops.unsqueeze(1).expand(5, 3, 128, 128)
+
+        # if self.is_train:
+        #     crops = self.transforms(crops)
 
         weights_crops = create_soft_labels_at_index(good_slice_idx)
         weights_crops = torch.softmax(torch.tensor(weights_crops), dim=0)
@@ -342,6 +354,15 @@ def get_loaders(datasets, flip_right):
     train_datasets = []
     valid_datasets = []
 
+    n_items = [0, 0, 0]
+    for dataset in datasets:
+        for item in dataset:
+            n_items[item['gt_label']] += 1
+
+    weights = [0, 0, 0]
+    for i in range(3):
+        weights[i] = sum(n_items) / n_items[i]
+
     for dataset in datasets:
         nb_valid = int(len(dataset) * 0.1)
         train_dataset = CropClassifierDataset(dataset[nb_valid:], flip_right, weight_labels=False, is_train=True)
@@ -354,10 +375,11 @@ def get_loaders(datasets, flip_right):
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=3)
     valid_loader = DataLoader(valid_dataset, batch_size=16, num_workers=3)
 
-    return train_loader, valid_loader
+    return train_loader, valid_loader, weights
 
 def train_submodel(model_name, flip_right, datasets):
     print()
+    print("-" * 50)
     print("-" * 50)
     print("-" * 50)
     print("-" * 50)
@@ -365,8 +387,9 @@ def train_submodel(model_name, flip_right, datasets):
     print("-" * 50)
     print("-" * 50)
     print("-" * 50)
+    print("-" * 50)
 
-    train_loader, valid_loader = get_loaders(datasets, flip_right)
+    train_loader, valid_loader, class_weights = get_loaders(datasets, flip_right)
 
     backbones = [
         'hgnet_tiny.paddle_in1k', 
@@ -388,12 +411,13 @@ def train_submodel(model_name, flip_right, datasets):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.6)
-    criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
+    criterion_train = torch.nn.CrossEntropyLoss(weight = torch.tensor(class_weights).float().to(device))
+    criterion_valid = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
 
     for epoch in range(20):
-        loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
-        metrics = validate(model, valid_loader, criterion, device)
+        loss_train = train_epoch(model, train_loader, criterion_train, optimizer, device, epoch)
+        metrics = validate(model, valid_loader, criterion_valid, device)
         print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
             print("New best model !")
@@ -409,12 +433,14 @@ def train_submodel(model_name, flip_right, datasets):
 if __name__ == "__main__":
 
     conditions = [
-        ["Left Subarticular Stenosis"], 
-        ["Right Subarticular Stenosis"],
+        ['Spinal Canal Stenosis'],
+        ["Left Neural Foraminal Narrowing"], 
+        ["Right Neural Foraminal Narrowing"],
+        ["Left Subarticular Stenosis", "Right Subarticular Stenosis"]
     ]
-    crop_sizes = [(128, 128), (128, 128)]
-    out_name = ["trained_axial/left128", "trained_axial/right128"]
-    use_flip = [False, False]
+    crop_sizes = [(80, 120), (80, 120), (80, 120), (128, 128)]
+    out_name = ["trained_realweightloss/classification_st2", "trained_realweightloss/classification_st1_left", "trained_realweightloss/classification_st1_right", "trained_realweightloss/classification_axial"]
+    use_flip = [False, False, False, True]
 
     metrics = dict()
     def train_and_collect_metrics(model_name, flip, datasets, step):
@@ -433,6 +459,7 @@ if __name__ == "__main__":
         datasets = generate_dataset("../", cond, cs, (640, 640))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            print("?")
             future_to_step = {executor.submit(train_and_collect_metrics, f"{out}_step_{step}.pth", flip, datasets, step): step for step in range(1)}
             
             for future in concurrent.futures.as_completed(future_to_step):

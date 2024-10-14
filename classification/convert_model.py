@@ -1,35 +1,30 @@
-import numpy as np
-import pandas as pd
 import tqdm
-import cv2
-import pydicom
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
-import torchvision.transforms.functional as FT
-import random
-import os
-
-import glob
 import torch
-import warnings
-warnings.filterwarnings("ignore") # warning on lstm
-from scipy.ndimage import label, center_of_mass
+import glob
 
-from models import *
+from models_v2 import *
 
 if __name__ == "__main__":
 
-    out_name = ["classification_st1_left.pth", "classification_st1_right.pth", "classification_st2.pth"] #, "classification_ax_left.pth", "classification_ax_right.pth"]
+    out_name = glob.glob("trained_axial/*.pth")
+    backbones = [
+        'hgnet_tiny.paddle_in1k', 
+        'densenet201.tv_in1k', 
+        'regnety_008.pycls_in1k', 
+        'focalnet_tiny_lrf.ms_in1k', 
+        'convnext_base.fb_in22k_ft_in1k',
+        'seresnext101_32x4d.gluon_in1k',
+    ]
 
     for out in tqdm.tqdm(out_name, desc="Converting"):
-        backbones_768 = ['focalnet_small_lrf.ms_in1k', 'cs3darknet_m.c2ns_in1k', 'convnextv2_tiny.fcmae_ft_in1k', 'twins_svt_base.in1k']
-        model = REM_Script(
+
+        model = REM_torchscript(
             n_classes=3,
-            n_fold_classifier=3,
-            backbones=backbones_768,
+            n_classifiers=3,
+            unification_size=768,
+            backbones=backbones,
         )
 
-        model.load_state_dict(torch.load(out))
+        model.load_state_dict(torch.load(out, weights_only=True, map_location='cpu'))
         scripted_model = torch.jit.script(model)
         scripted_model.save(out.replace(".pth", ".ts"))

@@ -38,7 +38,7 @@ class VIT_ImageEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = timm.create_model(
-                        "vit_base_patch16_224.augreg2_in21k_ft_in1k",
+                        "vit_small_patch16_224.augreg_in21k_ft_in1k",
                         pretrained=True,
         )
 
@@ -136,26 +136,25 @@ class SliceSelecterModelTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.image_encoder = VIT_ImageEncoder()
-        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=768, nhead=8, dim_feedforward=2048), num_layers=2)
-        self.classifiers = nn.Linear(768, 5)
+        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(batch_first=True, d_model=384, nhead=8, dim_feedforward=512), num_layers=2)
+        self.classifiers = nn.Linear(384, 5)
 
-    def forward(self, images):
+    def _encode(self, images):
         batch_size, seq_len, c, h, w = images.size()
-
-        encoded = list()
+        all_images = torch.empty((batch_size, seq_len, 3, h, w), device=images.device).float()
         for i in range(seq_len):
             if i == 0 or i == seq_len - 1:
-                im = images[:, i, ...]
-                im = im.expand(batch_size, 3, h, w)
-                encoded.append(self.image_encoder(im))
+                all_images[:, i] = images[:, i].repeat(1, 3, 1, 1)
             else:
-                im = images[:, i-1:i+2, ...].squeeze(2)
-                encoded.append(self.image_encoder(im))
+                triplet = images[:, i-1:i+2].squeeze(2)
+                all_images[:, i] = triplet
+        encoded_images = self.image_encoder(all_images.view(-1, 3, h, w))
+        encoded = encoded_images.view(batch_size, seq_len, -1)
+        return encoded
 
-        encoded = torch.stack(encoded, dim = 1)
-        encoded = encoded.permute(1, 0, 2)
+    def forward(self, images):
+        encoded = self._encode(images)
         transformer_out = self.transformer_encoder(encoded)
-        transformer_out = transformer_out.permute(1, 0, 2)
         outputs = self.classifiers(transformer_out)
         outputs = outputs.permute(0, 2, 1)
         return outputs.sigmoid(), outputs

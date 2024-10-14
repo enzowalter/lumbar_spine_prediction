@@ -5,7 +5,6 @@ import cv2
 import pydicom
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-import torchvision.transforms as transforms
 import random
 import concurrent.futures
 import glob
@@ -69,7 +68,7 @@ def generate_dataset(input_dir, crop_condition, crop_size, image_resize):
     for condition in crop_condition:
         all_coordinates = df_study_coordinates[df_study_coordinates['condition'] == condition].to_dict('records')
         dataset = list()
-        for coordinate in tqdm.tqdm(all_coordinates, desc=f"Parsing coordinates for {condition}..."):
+        for coordinate in tqdm.tqdm(all_coordinates[:3000], desc=f"Parsing coordinates for {condition}..."):
 
             s_id = coordinate['series_id']
             study_id = coordinate['study_id']
@@ -139,19 +138,12 @@ def z_score_normalize_all_slices(scan):
     z_normalized_scan = (scan - mean) / std
     return z_normalized_scan
 
-def get_soft_data_transforms():
-    return transforms.Compose([
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-        transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.5),
-    ])
-
 class CropClassifierDataset(Dataset):
     def __init__(self, infos, flip_right, weight_labels, is_train=False):
         self.datas = infos
         self.is_train = is_train
         self.flip_right = flip_right
-        self.transforms = get_soft_data_transforms()
-
+        
         if weight_labels:
             print('-' * 50)
             print("Sampling dataset")
@@ -160,9 +152,12 @@ class CropClassifierDataset(Dataset):
             nb_moderate = len([x for x in self.datas if x['gt_label'] == 1])
             nb_severe = len([x for x in self.datas if x['gt_label'] == 2])
 
+            # target_severe_count = nb_severe
+            # target_moderate_count = min(nb_moderate, 2 * target_severe_count)
+            # target_normal_count = min(nb_normal, 4 * target_severe_count)
             target_severe_count = nb_severe
             target_moderate_count = nb_moderate
-            target_normal_count = max(nb_moderate * 2, nb_severe * 4)
+            target_normal_count = min(nb_normal, 4 * target_severe_count)            
             
             normal_samples = [x for x in self.datas if x['gt_label'] == 0]
             moderate_samples = [x for x in self.datas if x['gt_label'] == 1]
@@ -173,11 +168,10 @@ class CropClassifierDataset(Dataset):
             selected_severe = random.sample(severe_samples, target_severe_count)
 
             self.datas = selected_normal + selected_moderate + selected_severe
-            random.shuffle(self.datas)
             
             print(f"Selected labels to fit 1, 2, 4 distribution: {len(selected_normal)} normal, {len(selected_moderate)} moderate {len(selected_severe)} severe !")
-            print('-' * 50)
 
+            random.shuffle(self.datas)
 
         print(f"Nb items in dataset: {len(self.datas)}")
 
@@ -257,12 +251,11 @@ def validate(model, loader, criterion, device):
             good_slice_idx = good_slice_idx.to(device).long()
             gt_weights = gt_weights.to(device).float()
             
-            outputs, crops_weight, selected_crops = model(images.to(device), mode = "inference")
+            outputs, crops_weight, selected_crops = model(images.to(device))
             
             weights_loss = 0
-            for i in range(model.nb_encoders):
-                good_crops_selection += (selected_crops[:, i] == good_slice_idx).float().sum()
-                weights_loss += nn.BCELoss()(crops_weight[:, i], gt_weights)
+            good_crops_selection += (selected_crops == good_slice_idx).float().sum()
+            weights_loss += nn.BCELoss()(crops_weight, gt_weights)
 
             total_loss_weight += weights_loss.mean().item()
 
@@ -277,37 +270,8 @@ def validate(model, loader, criterion, device):
     
     concat_loss = criterion(all_predictions, all_labels).item()
     avg_classification_loss = classification_loss_sum / len(loader)
-    print("Accuracy on crop selection:", good_crops_selection / (len(loader) * model.nb_encoders * 16))
+    print("Accuracy on crop selection:", good_crops_selection / (len(loader)*16))
     print("Loss on weights:", total_loss_weight / (len(loader)))
-    return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
-
-
-def validate_metamodel(model, loader, criterion, device):
-    print("-" * 50)
-    model.eval()
-    classification_loss_sum = 0
-    all_predictions = []
-    all_labels = []
-
-    with torch.no_grad():
-        for images, labels_gt, good_slice_idx, gt_weights in tqdm.tqdm(loader, desc="Valid"):
-            labels_gt = labels_gt.to(device).long()
-            good_slice_idx = good_slice_idx.to(device).long()
-            gt_weights = gt_weights.to(device).float()
-            
-            outputs = model(images.to(device))
-
-            all_predictions.append(outputs.cpu())
-            all_labels.append(labels_gt.cpu())
-            
-            loss = criterion(outputs, labels_gt)
-            classification_loss_sum += loss.item()
-
-    all_predictions = torch.cat(all_predictions, dim=0).to(device)
-    all_labels = torch.cat(all_labels, dim=0).to(device)
-    
-    concat_loss = criterion(all_predictions, all_labels).item()
-    avg_classification_loss = classification_loss_sum / len(loader)
     return {"concat_loss": concat_loss, "mean_loss": avg_classification_loss}
 
 def train_epoch(model, loader, criterion, optimizer, device, epoch):
@@ -322,9 +286,9 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch):
         good_slice_idx = good_slice_idx.to(device).long()
         gt_weights = gt_weights.to(device).float()
         
-        outputs, crops_weights, _ = model(images, mode = "train")
+        outputs, crops_weights, _ = model(images)
         weights_loss = nn.BCELoss()(crops_weights, gt_weights)
-    
+
         classification_loss = criterion(outputs, labels)
         total_loss = classification_loss + weights_loss
 
@@ -333,7 +297,6 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch):
         optimizer.step()
 
         epoch_loss += total_loss.item() / len(loader)
-
 
     return epoch_loss
 
@@ -344,45 +307,27 @@ def get_loaders(datasets, flip_right):
 
     for dataset in datasets:
         nb_valid = int(len(dataset) * 0.1)
-        train_dataset = CropClassifierDataset(dataset[nb_valid:], flip_right, weight_labels=False, is_train=True)
+        train_dataset = CropClassifierDataset(dataset[nb_valid:], flip_right, weight_labels=True, is_train=True)
         valid_dataset = CropClassifierDataset(dataset[:nb_valid], flip_right, weight_labels=False, is_train=False)
         valid_datasets.append(valid_dataset)
         train_datasets.append(train_dataset)
     
     train_dataset = torch.utils.data.ConcatDataset(train_datasets)
     valid_dataset = torch.utils.data.ConcatDataset(valid_datasets)
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=3)
-    valid_loader = DataLoader(valid_dataset, batch_size=16, num_workers=3)
+    train_loader = DataLoader(train_dataset, batch_size=12, shuffle=True, num_workers=2)
+    valid_loader = DataLoader(valid_dataset, batch_size=16, num_workers=2)
 
     return train_loader, valid_loader
 
-def train_submodel(model_name, flip_right, datasets):
-    print()
-    print("-" * 50)
-    print("-" * 50)
-    print("-" * 50)
-    print("TRAINING", model_name)
-    print("-" * 50)
-    print("-" * 50)
-    print("-" * 50)
-
+def train_submodel(backbone, flip_right, datasets, step):
     train_loader, valid_loader = get_loaders(datasets, flip_right)
 
-    backbones = [
-        'hgnet_tiny.paddle_in1k', 
-        'densenet201.tv_in1k', 
-        'regnety_008.pycls_in1k', 
-        'focalnet_tiny_lrf.ms_in1k', 
-        'convnext_base.fb_in22k_ft_in1k',
-        'seresnext101_32x4d.gluon_in1k',
-    ]
-
-    model = REM(
+    model = REM_SimpleEncoder(
         n_classes=3,
-        n_classifiers=3,
-        unification_size=768,
-        backbones=backbones,
+        backbone=backbone,
+        unification_size=512
     )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -391,14 +336,13 @@ def train_submodel(model_name, flip_right, datasets):
     criterion = torch.nn.CrossEntropyLoss(weight = torch.tensor([1, 2, 4]).float().to(device))
     best = 123456
 
-    for epoch in range(20):
+    for epoch in range(5):
         loss_train = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
         metrics = validate(model, valid_loader, criterion, device)
-        print("Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
+        print("Step:", step, "Epoch", epoch, "train_loss=", loss_train, "metrics=", metrics)
         if metrics['concat_loss'] < best:
             print("New best model !")
             best = metrics["concat_loss"]
-            torch.save(model.state_dict(), model_name)
 
         print('-' * 50)
         scheduler.step()
@@ -408,41 +352,71 @@ def train_submodel(model_name, flip_right, datasets):
 
 if __name__ == "__main__":
 
-    conditions = [
-        ["Left Subarticular Stenosis"], 
-        ["Right Subarticular Stenosis"],
-    ]
-    crop_sizes = [(128, 128), (128, 128)]
-    out_name = ["trained_axial/left128", "trained_axial/right128"]
-    use_flip = [False, False]
+    backbones = [
+                # 'cs3darknet_m.c2ns_in1k', # 0.3382236659526825
+                 'hgnet_tiny.paddle_in1k', # 0.302169531583786
+                #  'ese_vovnet39b.ra_in1k', #  0.3205832839012146
+                 'densenet201.tv_in1k', # 0.2896789312362671  hightly instable
+                #  'inception_next_small.sail_in1k',  # 0.3113342523574829
+                #  'ecaresnet50d.miil_in1k', # 0.3693075478076935
+                #  'cspresnet50.ra_in1k',  # 0.30856069922447205 hightly instable
+                 'regnety_008.pycls_in1k', # 0.29512783885002136 
+                #  'sam2_hiera_small', # crash shape
+                #  'efficientnet_b0.ra_in1k', # 0.3174702823162079
+                #  'focalnet_small_lrf.ms_in1k', # 0.3004891574382782
+                #  'resnet50.a1_in1k', # 0.3542621433734894
+                 'focalnet_tiny_lrf.ms_in1k', # 0.2972612679004669
+                 'convnext_base.fb_in22k_ft_in1k', # 0.29600077867507935
+                #  'mobilenetv3_large_100.ra_in1k', # 0.30985793471336365
+                #  'hiera_base_224.mae', # crash shape
+                #  'regnety_002.pycls_in1k', # 0.30842500925064087
+                #  'efficientnet_b3.ra2_in1k', # 0.3608832061290741
+                #  'inception_v3', # 0.3199085593223572
+                #  'xcit_large_24_p8_224.fb_in1k', # crash overflow
+                #  'dm_nfnet_f0.dm_in1k', # 0.309096097946167
+                #  'xception65.ra3_in1k', # don't learn
+                #  'xception', # 0.3219481110572815
+                #  'resnet26t.ra2_in1k', # 0.3196611702442169
+                #  'res2net50_26w_4s.in1k', # 0.3246822953224182
+                #  'seresnet50.a1_in1k', # 0.3297916054725647
+                #  'ecaresnet26t.ra2_in1k', # 0.30535775423049927
+                #  'convnext_tiny.fb_in1k', # 0.303860604763031
+                #  'densenet121.tv_in1k', # 0.3154330551624298
+                #  'convnextv2_tiny.fcmae_ft_in1k', # 0.3226335048675537
+                #  'densenet161.tv_in1k', # 0.30910205841064453
+                 'seresnext101_32x4d.gluon_in1k', # 0.29973897337913513
+                #  'ese_vovnet19b_dw.ra_in1k', # 0.33316367864608765
+                #  'mobilenetv3_small_100.lamb_in1k', # 0.31671151518821716
+                #  'twins_svt_base.in1k' # 0.35884371399879456
+            ]
 
     metrics = dict()
+
     def train_and_collect_metrics(model_name, flip, datasets, step):
         print('-' * 50)
-        print(f"Training: {cond}")
         best = train_submodel(
-            model_name=model_name,
+            backbone=model_name,
             flip_right=flip,
             datasets = datasets,
+            step=step
         )
         return step, best
 
-    for cond, cs, out, flip in zip(conditions, crop_sizes, out_name, use_flip):
+    datasets = generate_dataset("../", ['Spinal Canal Stenosis'], (80, 120), (640, 640))
+    for backbone in backbones:
+        metrics[backbone] = []
 
-        metrics[str(cond)] = []
-        datasets = generate_dataset("../", cond, cs, (640, 640))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future_to_step = {executor.submit(train_and_collect_metrics, f"{out}_step_{step}.pth", flip, datasets, step): step for step in range(1)}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_to_step = {executor.submit(train_and_collect_metrics, backbone, False, datasets, step): step for step in range(3)}
             
             for future in concurrent.futures.as_completed(future_to_step):
                 step = future_to_step[future]
                 try:
                     step_num, best = future.result()
-                    metrics[str(cond)].append((step_num, best))
-                    print(f"Metrics for {cond}, step {step_num}: {best}")
+                    metrics[backbone].append((step_num, best))
+                    print(f"Metrics for {backbone}, step {step_num}: {best}")
                 except Exception as exc:
-                    print(f"{cond}, step {step} generated an exception: {exc}")
+                    print(f"{backbone}, step {step} generated an exception: {exc}")
 
     print("Done!")
     print("All metrics:", metrics)

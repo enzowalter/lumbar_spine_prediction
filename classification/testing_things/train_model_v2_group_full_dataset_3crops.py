@@ -123,11 +123,11 @@ def generate_dataset(input_dir, crop_condition, crop_size, image_resize):
 ############################################################
 
 def create_soft_labels_at_index(center_idx):
-    weights_crops = np.array([0, 0, 0, 0, 0])
-    weights = [0.025, 0.2, 2, 0.2, 0.025]
+    weights_crops = np.array([0, 0, 0])
+    weights = [0.2, 2, 0.2]
     soft_labels = np.zeros_like(weights_crops, dtype=float)
     for i, weight in enumerate(weights):
-        offset = i - 2
+        offset = i - 1
         if 0 <= center_idx + offset < len(weights_crops):
             soft_labels[center_idx + offset] = weight
     return soft_labels
@@ -190,14 +190,14 @@ class CropClassifierDataset(Dataset):
         original_idx = data['original_index']
         all_slices_path = data['all_slices']
 
-        index_offsets = [-2, -1, 0, 1, 2]
-        weights = [0.025, 0.175, 0.6, 0.175, 0.025]
+        index_offsets = [-1, 0, 1]
+        weights = [0.2, 0.6, 0.2]
 
         valid_offsets = []
         valid_weights = []
         for offset, weight in zip(index_offsets, weights):
             offset_index = original_idx + offset
-            if 0 <= offset_index - 2 and offset_index + 2 < len(all_slices_path):
+            if 0 <= offset_index - 1 and offset_index + 1 < len(all_slices_path):
                 valid_offsets.append(offset)
                 valid_weights.append(weight)
 
@@ -211,11 +211,9 @@ class CropClassifierDataset(Dataset):
         offset_index = original_idx + offset
 
         slices_path = [
-            all_slices_path[offset_index - 2],
             all_slices_path[offset_index - 1],
             all_slices_path[offset_index],
             all_slices_path[offset_index + 1],
-            all_slices_path[offset_index + 2]
         ]
 
         if self.is_train:
@@ -229,7 +227,7 @@ class CropClassifierDataset(Dataset):
             crops = cut_crops(slices_path, x, y, data['crop_size'], data['image_resize'], flip = False)
         crops = z_score_normalize_all_slices(crops)
         crops = torch.tensor(crops).float()
-        crops = crops.unsqueeze(1).expand(5, 3, 128, 128)
+        crops = crops.unsqueeze(1).expand(3, 3, 128, 128)
 
         weights_crops = create_soft_labels_at_index(good_slice_idx)
         weights_crops = torch.softmax(torch.tensor(weights_crops), dim=0)
@@ -409,12 +407,14 @@ def train_submodel(model_name, flip_right, datasets):
 if __name__ == "__main__":
 
     conditions = [
-        ["Left Subarticular Stenosis"], 
-        ["Right Subarticular Stenosis"],
+        ['Spinal Canal Stenosis'],
+        ["Left Neural Foraminal Narrowing"], 
+        ["Right Neural Foraminal Narrowing"],
+        ["Left Subarticular Stenosis", "Right Subarticular Stenosis"]
     ]
-    crop_sizes = [(128, 128), (128, 128)]
-    out_name = ["trained_axial/left128", "trained_axial/right128"]
-    use_flip = [False, False]
+    crop_sizes = [(80, 120), (80, 120), (80, 120), (128, 128)]
+    out_name = ["trained_realweightloss/classification_st2", "trained_realweightloss/classification_st1_left", "trained_realweightloss/classification_st1_right", "trained_realweightloss/classification_axial"]
+    use_flip = [False, False, False, True]
 
     metrics = dict()
     def train_and_collect_metrics(model_name, flip, datasets, step):
